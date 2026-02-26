@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtuelle Umgebungen
+.venv/
+venv/
+.venv_test/
+venv_test/
+.env/
+*.env
+.venv
+node_modules/
+
+# Editor-/Systemdateien
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Linter-/Typ-Caches
+.mypy_cache/
+.ruff_cache/
+
+# Build-/Dist-/Egg-Ordner
+build/
+dist/
+*.egg-info/
+
+# Tests/Cache
+.pytest_cache/
+.coverage
+temp/
+
+#DB
+*.db
+
+#tests
+/test_results/
+/logs/
+/input
+/job_files/
+
+#requirements
+*_dev.in
+*_dev.txt
+*_cpu.in
+*_gpu.in

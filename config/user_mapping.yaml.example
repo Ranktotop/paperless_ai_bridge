@@ -1,0 +1,17 @@
+# User mapping: frontend identity → Paperless-ngx credentials
+#
+# Maps the user_id sent by OpenWebUI/AnythingLLM to the corresponding
+# Paperless-ngx owner_id and API token. This controls which documents
+# each user can access via the AI-Bridge.
+#
+# Copy this file to user_mapping.yaml and fill in real values.
+# Never commit user_mapping.yaml to version control.
+
+users:
+  - frontend_user_id: "openwebui-user-alice"
+    paperless_owner_id: 1
+    paperless_api_token: "alice-paperless-token-here"
+
+  - frontend_user_id: "openwebui-user-bob"
+    paperless_owner_id: 2
+    paperless_api_token: "bob-paperless-token-here"
