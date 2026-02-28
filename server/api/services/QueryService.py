@@ -7,7 +7,7 @@ Phase III (future): add LangChain ReAct agent with intent classification and
 
 from shared.clients.EmbedInterface import EmbedInterface
 from shared.clients.VectorDBInterface import VectorDBInterface
-from shared.helper.config_helper import HelperConfig
+from shared.helper.HelperConfig import HelperConfig
 from shared.models.search import SearchRequest, SearchResponse, SearchResultItem
 
 

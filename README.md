@@ -130,7 +130,6 @@ Copy `.env.example` to `.env` and fill in your values.
 | `PAPERLESS_BASE_URL` | `http://paperless:8000` | Paperless-ngx base URL |
 | `PAPERLESS_API_TOKEN` | — | Paperless-ngx API token |
 | `PAPERLESS_TIMEOUT` | `30` | HTTP timeout in seconds |
-| `PAPERLESS_DEFAULT_OWNER_ID` | — | Fallback `owner_id` for documents with `owner=null` (e.g. admin-created). Leave unset to skip ownerless documents. |
 | `QDRANT_BASE_URL` | `http://qdrant:6333` | Qdrant REST API base URL |
 | `QDRANT_COLLECTION` | `paperless_docs` | Qdrant collection name |
 | `QDRANT_TIMEOUT` | `30` | HTTP timeout in seconds |

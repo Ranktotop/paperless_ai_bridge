@@ -9,10 +9,10 @@ import os
 from server.api.routers.QueryRouter import query_router
 from server.api.routers.WebhookRouter import webhook_router
 from server.api.services.QueryService import QueryService
-from shared.clients.DMSPaperless import DMSPaperless
+from shared.clients.dms.paperless.DMSClientPaperless import DMSClientPaperless
 from shared.clients.EmbedClientOllama import EmbedClientOllama
 from shared.clients.VectorDBQdrant import VectorDBQdrant
-from shared.helper.config_helper import HelperConfig
+from shared.helper.HelperConfig import HelperConfig
 from shared.logging.logging_setup import setup_logging
 from sync.services.SyncService import SyncService
 
@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.config = HelperConfig(logger=app.state.logging)
 
     # Initialise clients
-    paperless_client = DMSPaperless(helper_config=app.state.config)
+    paperless_client = DMSClientPaperless(helper_config=app.state.config)
     qdrant_client = VectorDBQdrant(helper_config=app.state.config)
     embed_client = EmbedClientOllama(helper_config=app.state.config)
     await paperless_client.boot()
