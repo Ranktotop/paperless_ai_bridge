@@ -4,7 +4,7 @@
 
 mkdir -p /app/logs
 
-uvicorn server.api.api_app:app \
+uvicorn server.api_server:app \
     --host 0.0.0.0 \
     --port 8080 \
     --log-level info &

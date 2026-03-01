@@ -1,13 +1,13 @@
 """Central configuration helper for the paperless AI bridge."""
 
-import logging
+from shared.logging.logging_setup import ColorLogger
 import os
 
 
 class HelperConfig:
     """Central configuration helper. Reads all settings from environment variables."""
 
-    def __init__(self, logger: logging.Logger) -> None:
+    def __init__(self, logger: ColorLogger) -> None:
         self._logger = logger
 
     def get_string_val(self, key: str, default: str | None = None) -> str:
@@ -112,7 +112,7 @@ class HelperConfig:
         except ValueError as e:
             raise ValueError(f"Environment variable '{key}' contains invalid elements: {e}. Expected format: '[elem1{separator}elem2{separator}...]'. Type set to {element_type.__name__}. Got: '{raw_val}'")
 
-    def get_logger(self) -> logging.Logger:
+    def get_logger(self) -> ColorLogger:
         """Return the application logger.
 
         Returns:

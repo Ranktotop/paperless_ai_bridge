@@ -12,19 +12,19 @@ class DocumentBase(BaseModel):
     Represents a single document with all its metadata, as returned by a DMS client.
     """
     engine:str
-    id: int
+    id: str
 
 class DocumentDetails(DocumentBase):
     """
     Represents a single document with all its metadata, as returned by a DMS client.
     """
-    correspondent_id: int | None = None
-    document_type_id: int | None = None
+    correspondent_id: str | None = None
+    document_type_id: str | None = None
     title: str | None = None
     content: str | None = None
-    tag_ids: list[int] = []
+    tag_ids: list[str] = []
     created_date: datetime | None = None
-    owner_id : int | None = None
+    owner_id : str | None = None
     mime_type: str | None = None
     file_name: str | None = None
 

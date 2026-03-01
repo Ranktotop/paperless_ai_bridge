@@ -1,5 +1,6 @@
 from abc import abstractmethod
 from typing import Any
+import math
 
 import httpx
 from shared.clients.rag.models.Scroll import ScrollResult
@@ -95,7 +96,19 @@ class RAGClientInterface(ClientInterface):
         pass
 
     @abstractmethod
-    def get_scroll_payload(self, filters: list[dict], with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None) -> dict:
+    def _get_endpoint_count(self) -> str:
+        """Returns the endpoint path for counting points matching a filter.
+
+        Returns:
+            str: The endpoint path (e.g. "/collections/my_col/points/count")
+
+        Raises:
+            NotImplementedError: If the method is not implemented in a subclass.
+        """
+        pass
+
+    @abstractmethod
+    def get_scroll_payload(self, filters: list[dict], with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None, offset: str | None = None) -> dict:
         """
         Returns the payload template for scroll requests to the RAG backend.
 
@@ -104,9 +117,45 @@ class RAGClientInterface(ClientInterface):
             with_payload (bool | list | dict): Whether to include the payload in the scroll request, or which payload fields to include.
             with_vector (bool | list): Whether to include the vector in the scroll request, or which vector fields to include.
             limit (int | None): The maximum number of results to return.
+            offset (str | None): Pagination cursor returned by the previous scroll page.
+                                 None means start from the beginning.
 
         Returns:
             dict: The payload for the scroll request.
+
+        Raises:
+            NotImplementedError: If the method is not implemented in a subclass.
+        """
+        pass
+
+    @abstractmethod
+    def extract_next_page_offset(self, raw_response: dict) -> str | None:
+        """
+        Extracts the pagination cursor for the next scroll page from a raw response.
+
+        Analogous to the nextPage field in DMSClientInterface list responses.
+        Return None when the backend signals that no further pages exist.
+
+        Args:
+            raw_response (dict): The raw JSON response from the scroll endpoint.
+
+        Returns:
+            str | None: The cursor for the next page, or None if this was the last page.
+
+        Raises:
+            NotImplementedError: If the method is not implemented in a subclass.
+        """
+        pass
+
+    @abstractmethod
+    def get_count_payload(self, filters: list[dict]) -> dict:
+        """Builds the backend-specific request payload for a point count.
+
+        Args:
+            filters (list[dict]): Filter conditions to apply before counting.
+
+        Returns:
+            dict: The payload for the count request.
 
         Raises:
             NotImplementedError: If the method is not implemented in a subclass.
@@ -208,28 +257,94 @@ class RAGClientInterface(ClientInterface):
             raise_on_error=True,
         )
 
-    async def do_scroll(self, filters: dict, with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None) -> ScrollResult:
-        """Scroll through a collection in the rag backend.
+    async def do_scroll(self, filters: dict, with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None, offset: str | None = None) -> ScrollResult:
+        """Scroll a single page from a collection in the RAG backend.
+
+        To retrieve all matching points across an arbitrary number of pages use
+        do_scroll_all() instead.
 
         Args:
             filters (dict): The filters to apply to the scroll request.
             with_payload (bool | list | dict): Whether to include the payload in the scroll request, or which payload fields to include.
             with_vector (bool | list): Whether to include the vector in the scroll request.
-            limit (int | None): The maximum number of results to return.
+            limit (int | None): The maximum number of results to return per page.
+            offset (str | None): Pagination cursor from the previous page's next_page_offset.
+                                 None starts from the beginning of the collection.
 
         Returns:
-            ScrollResult: The result from the scroll request.
+            ScrollResult: The result from the scroll request, including next_page_offset
+                          when further pages are available.
         """
         resp = await self.do_request(
             method="POST",
-            content=json.dumps(self.get_scroll_payload(filters, with_payload, with_vector, limit)),
+            content=json.dumps(self.get_scroll_payload(filters, with_payload, with_vector, limit, offset)),
             endpoint=self._get_endpoint_scroll(),
             additional_headers={"Content-Type": "application/json"},
-            raise_on_error=True
-            )
-        scroll_content = self.extract_scroll_content(raw_response=resp.json())
+            raise_on_error=True,
+        )
+        raw_response = resp.json()
+        scroll_content = self.extract_scroll_content(raw_response=raw_response)
         return ScrollResult(
-                result=scroll_content.get("result", []),
-                status=scroll_content.get("status", "ok"),
-                time=scroll_content.get("time", 0),
+            result=scroll_content.get("result", []),
+            status=scroll_content.get("status", "ok"),
+            time=scroll_content.get("time", 0),
+            next_page_offset=self.extract_next_page_offset(raw_response),
+        )
+
+    async def do_count(self, filters: list[dict]) -> int:
+        """Count the total number of points matching the given filters.
+
+        Args:
+            filters (list[dict]): Filter conditions for the count request.
+
+        Returns:
+            int: Total number of matching points.
+        """
+        resp = await self.do_request(
+            method="POST",
+            content=json.dumps(self.get_count_payload(filters)),
+            endpoint=self._get_endpoint_count(),
+            additional_headers={"Content-Type": "application/json"},
+            raise_on_error=True,
+        )
+        return resp.json().get("result", {}).get("count", 0)
+
+    async def do_scroll_all(self, filters: dict, with_payload: bool | list | dict, with_vector: bool | list) -> ScrollResult:
+        """Scroll through ALL points matching the filter, paginating automatically.
+
+        Analogous to do_fetch_documents() in DMSClientInterface — runs a loop
+        driven by next_page_offset until the backend signals there are no more pages.
+
+        Args:
+            filters (dict): The filters to apply to the scroll request.
+            with_payload (bool | list | dict): Whether to include the payload, or which fields.
+            with_vector (bool | list): Whether to include the vector in each result point.
+
+        Returns:
+            ScrollResult: All matching points collected across all pages.
+                          next_page_offset is always None on the returned result.
+        """
+        page_size = 1000
+        all_points: list[dict] = []
+        offset: str | None = None
+        page = 1
+        total_points = await self.do_count(filters)
+        total_pages = math.ceil(total_points / page_size) if total_points > 0 else 1
+        while True:
+            page_result = await self.do_scroll(
+                filters=filters,
+                with_payload=with_payload,
+                with_vector=with_vector,
+                limit=page_size,
+                offset=offset,
             )
+            all_points.extend(page_result.result)
+            self.logging.info(
+                "Fetched RAG points page %d of %d from %s, total points so far: %d of %d",
+                page, total_pages, self.get_engine_name(),len(all_points), total_points,
+            )
+            offset = page_result.next_page_offset
+            if not offset:
+                break
+            page += 1
+        return ScrollResult(result=all_points, status="ok", time=0)

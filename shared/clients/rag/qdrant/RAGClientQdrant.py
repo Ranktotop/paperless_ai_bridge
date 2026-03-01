@@ -55,16 +55,26 @@ class RAGClientQdrant(RAGClientInterface):
     def _get_endpoint_create_collection(self) -> str:
         return f"/collections/{self._collection_name}"
 
+    def _get_endpoint_count(self) -> str:
+        return f"/collections/{self._collection_name}/points/count"
+
     ##########################################
     ########### PAYLOAD BUILDER ##############
     ##########################################
 
-    def get_scroll_payload(self, filters: list[dict], with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None) -> dict:
-        return {
+    def get_scroll_payload(self, filters: list[dict], with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None, offset: str | None = None) -> dict:
+        payload = {
             "filter": {"must": filters},
             "limit": limit,
             "with_payload": with_payload,
-            "with_vector": with_vector}
+            "with_vector": with_vector,
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        return payload
+
+    def get_count_payload(self, filters: list[dict]) -> dict:
+        return {"filter": {"must": filters}, "exact": True}
 
     def get_delete_payload(self, filter: dict) -> dict:
         return {"filter": filter}
@@ -74,4 +84,12 @@ class RAGClientQdrant(RAGClientInterface):
     ##########################################
 
     def extract_scroll_content(self, raw_response: dict) -> dict:
-        return raw_response
+        result = raw_response.get("result", {})
+        return {
+            "result": result.get("points", []),
+            "status": raw_response.get("status", "ok"),
+            "time": raw_response.get("time", 0),
+        }
+
+    def extract_next_page_offset(self, raw_response: dict) -> str | None:
+        return raw_response.get("result", {}).get("next_page_offset")

@@ -261,38 +261,38 @@ class DMSClientPaperless(DMSClientInterface):
         return DocumentDetails(
                 #base
                 engine=self._get_engine_name(),
-                id=response.get("id"),
+                id=str(response.get("id")),
 
                 #details
-                correspondent_id=response.get("correspondent"),
-                document_type_id=response.get("document_type"),
+                correspondent_id=str(v) if (v := response.get("correspondent")) is not None else None,
+                document_type_id=str(v) if (v := response.get("document_type")) is not None else None,
                 title=response.get("title"),
                 content=response.get("content"),
-                tag_ids=response.get("tags", []),
-                created_date=datetime.fromisoformat(response.get("created_date")) if response.get("created_date") else None,                
-                owner_id=response.get("owner"),
+                tag_ids=[str(t) for t in response.get("tags", [])],
+                created_date=datetime.fromisoformat(response.get("created_date")) if response.get("created_date") else None,
+                owner_id=str(v) if (v := response.get("owner")) is not None else None,
                 mime_type=response.get("mime_type"),
                 file_name=response.get("original_file_name")
             )
-    
+
     def _parse_endpoint_correspondent(self, response: dict) -> CorrespondentDetails:
         return CorrespondentDetails(
                 #base
                 engine=self._get_engine_name(),
-                id=response.get("id"),
+                id=str(response.get("id")),
 
                 #details
                 name=response.get("name"),
-                slug=response.get("slug"),               
-                owner_id=response.get("owner"),
+                slug=response.get("slug"),
+                owner_id=str(v) if (v := response.get("owner")) is not None else None,
                 documents=response.get("documents_count")
             )
-    
+
     def _parse_endpoint_owner(self, response: dict) -> OwnerDetails:
         return OwnerDetails(
                 #base
                 engine=self._get_engine_name(),
-                id=response.get("id"),
+                id=str(response.get("id")),
 
                 #details
                 username=response.get("username"),
@@ -300,29 +300,29 @@ class DMSClientPaperless(DMSClientInterface):
                 firstname=response.get("first_name"),
                 lastname=response.get("last_name")
             )
-    
+
     def _parse_endpoint_tag(self, response: dict) -> TagDetails:
         return TagDetails(
                 #base
                 engine=self._get_engine_name(),
-                id=response.get("id"),
+                id=str(response.get("id")),
 
                 #details
                 name=response.get("name"),
-                slug=response.get("slug"),               
-                owner_id=response.get("owner"),
+                slug=response.get("slug"),
+                owner_id=str(v) if (v := response.get("owner")) is not None else None,
                 documents=response.get("documents_count")
             )
-    
+
     def _parse_endpoint_document_type(self, response: dict) -> DocumentTypeDetails:
         return DocumentTypeDetails(
                 #base
                 engine=self._get_engine_name(),
-                id=response.get("id"),
+                id=str(response.get("id")),
 
                 #details
                 name=response.get("name"),
-                slug=response.get("slug"),               
-                owner_id=response.get("owner"),
+                slug=response.get("slug"),
+                owner_id=str(v) if (v := response.get("owner")) is not None else None,
                 documents=response.get("documents_count")
             )

@@ -8,7 +8,7 @@ class OwnerBase(BaseModel):
     Represents a single Owner with all its metadata, as returned by a DMS client.
     """
     engine:str
-    id: int
+    id: str
 
 class OwnerDetails(OwnerBase):
     """

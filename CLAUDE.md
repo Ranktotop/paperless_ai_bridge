@@ -154,10 +154,10 @@ _get_endpoint_chat()
 ```
 
 Instance attributes (set in `__init__`):
-- `self.embed_model` — reads `LLM_MODEL`
+- `self.embed_model` — reads `LLM_MODEL_EMBEDDING`
 - `self.embed_distance` — reads `LLM_DISTANCE` (default: `Cosine`)
-- `self.embed_model_max_chars` — reads `LLM_MODEL_MAX_CHARS`
-- `self.chat_model` — reads `LLM_CHAT_MODEL` (optional; falls back to `embed_model`)
+- `self.embed_model_max_chars` — reads `LLM_MODEL_EMBEDDING_MAX_CHARS`
+- `self.chat_model` — reads `LLM_MODEL_CHAT` (optional; falls back to `embed_model`)
 
 Current implementation: `LLMClientOllama`
 Factory: `LLMClientManager` — reads `LLM_ENGINE` from env
@@ -467,7 +467,7 @@ Pattern: `{CLIENT_TYPE}_{ENGINE_NAME}_{SETTING}`
 DMS_PAPERLESS_BASE_URL     DMS_PAPERLESS_API_KEY
 RAG_QDRANT_BASE_URL        RAG_QDRANT_COLLECTION
 LLM_OLLAMA_BASE_URL        LLM_OLLAMA_API_KEY
-LLM_MODEL                  LLM_CHAT_MODEL         LLM_DISTANCE
+LLM_MODEL_EMBEDDING        LLM_MODEL_CHAT         LLM_DISTANCE
 ```
 
 Never call `os.getenv()` directly in business logic — always use `HelperConfig`.

@@ -643,7 +643,7 @@ class DMSClientInterface(ClientInterface):
             else:
                 detailed_documents.append(document)
 
-        self._cache_documents = {str(document.id): document for document in detailed_documents}
+        self._cache_documents = {document.id: document for document in detailed_documents}
         return self._cache_documents
 
 
@@ -676,7 +676,7 @@ class DMSClientInterface(ClientInterface):
             else:
                 detailed_correspondents.append(correspondent)
 
-        self._cache_correspondents = {str(correspondent.id): correspondent for correspondent in detailed_correspondents}
+        self._cache_correspondents = {correspondent.id: correspondent for correspondent in detailed_correspondents}
         return self._cache_correspondents
     
     async def get_owners(self, force: bool = False) -> dict[str, OwnerDetails]:
@@ -708,7 +708,7 @@ class DMSClientInterface(ClientInterface):
             else:
                 detailed_owners.append(owner)
         
-        self._cache_owners = {str(owner.id): owner for owner in detailed_owners}
+        self._cache_owners = {owner.id: owner for owner in detailed_owners}
         return self._cache_owners
     
     async def get_tags(self, force: bool = False) -> dict[str, TagDetails]:
@@ -740,7 +740,7 @@ class DMSClientInterface(ClientInterface):
             else:
                 detailed_tags.append(tag)
 
-        self._cache_tags = {str(tag.id): tag for tag in detailed_tags}
+        self._cache_tags = {tag.id: tag for tag in detailed_tags}
         return self._cache_tags
     
     async def get_document_types(self, force: bool = False) -> dict[str, DocumentTypeDetails]:
@@ -772,5 +772,5 @@ class DMSClientInterface(ClientInterface):
             else:
                 detailed_document_types.append(doc_type)
 
-        self._cache_document_types = {str(doc_type.id): doc_type for doc_type in detailed_document_types}
+        self._cache_document_types = {doc_type.id: doc_type for doc_type in detailed_document_types}
         return self._cache_document_types

@@ -8,7 +8,7 @@ class TagBase(BaseModel):
     Represents a single Tag with all its metadata, as returned by a DMS client.
     """
     engine:str
-    id: int
+    id: str
 
 class TagDetails(TagBase):
     """
@@ -16,7 +16,7 @@ class TagDetails(TagBase):
     """
     name: str | None = None
     slug: str | None = None
-    owner_id : int | None = None
+    owner_id : str | None = None
     documents: int | None = None
 
 class TagsListResponse(BaseModel):

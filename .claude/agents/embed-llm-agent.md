@@ -66,10 +66,10 @@ Use `WebFetch` to look up Ollama API documentation and any future provider APIs.
 - `_get_endpoint_chat() -> str`
 
 **Instance attributes set in `__init__`:**
-- `self.embed_model` — reads `LLM_MODEL`
+- `self.embed_model` — reads `LLM_MODEL_EMBEDDING`
 - `self.embed_distance` — reads `LLM_DISTANCE` (default: `Cosine`)
-- `self.embed_model_max_chars` — reads `LLM_MODEL_MAX_CHARS`
-- `self.chat_model` — reads `LLM_CHAT_MODEL`
+- `self.embed_model_max_chars` — reads `LLM_MODEL_EMBEDDING_MAX_CHARS`
+- `self.chat_model` — reads `LLM_MODEL_CHAT`
 
 ### LLMClientOllama — current implementation
 - Embedding: POST `/api/embed` with `{"model": embed_model, "input": [...]}`
@@ -84,10 +84,10 @@ Use `WebFetch` to look up Ollama API documentation and any future provider APIs.
 - `LLM_OLLAMA_API_KEY`
 
 **Interface-level config keys (via HelperConfig directly):**
-- `LLM_MODEL` — embedding model (e.g. `nomic-embed-text`)
-- `LLM_CHAT_MODEL` — chat model (e.g. `llama3`); optional, falls back to `LLM_MODEL`
+- `LLM_MODEL_EMBEDDING` — embedding model (e.g. `nomic-embed-text`)
+- `LLM_MODEL_CHAT` — chat model (e.g. `llama3`); optional, falls back to `LLM_MODEL_EMBEDDING`
 - `LLM_DISTANCE` — Qdrant distance metric (default: `Cosine`)
-- `LLM_MODEL_MAX_CHARS` — max characters per chunk
+- `LLM_MODEL_EMBEDDING_MAX_CHARS` — max characters per chunk
 
 ### Adding a new LLM/embedding provider
 1. Create `shared/clients/llm/{engine_lower}/LLMClient{Engine}.py`

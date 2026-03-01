@@ -8,7 +8,7 @@ class CorrespondentBase(BaseModel):
     Represents a single Correspondent with all its metadata, as returned by a DMS client.
     """
     engine:str
-    id: int
+    id: str
 
 class CorrespondentDetails(CorrespondentBase):
     """
@@ -16,7 +16,7 @@ class CorrespondentDetails(CorrespondentBase):
     """
     name: str | None = None
     slug: str | None = None
-    owner_id : int | None = None
+    owner_id : str | None = None
     documents: int | None = None
 
 class CorrespondentsListResponse(BaseModel):

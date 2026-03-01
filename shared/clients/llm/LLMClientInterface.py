@@ -12,11 +12,11 @@ class LLMClientInterface(ClientInterface):
 
         # embedding config
         self.embed_distance = helper_config.get_string_val(f"{self.get_client_type().upper()}_DISTANCE", default="Cosine")
-        self.embed_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_MODEL", default=None)
-        self.embed_model_max_chars = helper_config.get_number_val(f"{self.get_client_type().upper()}_MODEL_MAX_CHARS", default=None)
+        self.embed_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_MODEL_EMBEDDING", default=None)
+        self.embed_model_max_chars = helper_config.get_number_val(f"{self.get_client_type().upper()}_MODEL_EMBEDDING_MAX_CHARS", default=None)
 
         # chat / completion config
-        self.chat_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_CHAT_MODEL", default=None)
+        self.chat_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_MODEL_CHAT", default=None)
 
     ##########################################
     ############### CHECKER ##################
