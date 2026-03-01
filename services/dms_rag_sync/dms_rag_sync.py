@@ -14,8 +14,8 @@ from shared.clients.dms.DMSClientManager import DMSClientManager
 from shared.clients.rag.RAGClientManager import RAGClientManager
 from shared.clients.rag.RAGClientInterface import RAGClientInterface
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
-from shared.clients.embed.EmbedClientManager import EmbedClientManager
-from shared.clients.embed.EmbedClientInterface import EmbedClientInterface
+from shared.clients.llm.LLMClientManager import LLMClientManager
+from shared.clients.llm.LLMClientInterface import LLMClientInterface
 from services.dms_rag_sync.SyncService import SyncService
 from shared.helper.HelperConfig import HelperConfig
 from shared.logging.logging_setup import setup_logging
@@ -27,7 +27,7 @@ async def main() -> None:
     config = HelperConfig(logger=logger)
     dmsManager = DMSClientManager(helper_config=config)
     ragManager = RAGClientManager(helper_config=config)
-    embedManager = EmbedClientManager(helper_config=config)
+    embedManager = LLMClientManager(helper_config=config)
 
     # init clients
     dms_clients = dmsManager.get_clients()
@@ -37,7 +37,7 @@ async def main() -> None:
     try:
         booted_dms_clients: list[DMSClientInterface] = []
         booted_rag_clients: list[RAGClientInterface] = []
-        booted_embed_client: EmbedClientInterface | None = None
+        booted_embed_client: LLMClientInterface | None = None
 
         # boot all clients
         ## embed client is required, if it fails to boot, we cannot continue, as there is no point in syncing without embedding. So we abort the whole process if embed client fails.

@@ -1,7 +1,7 @@
 """Synchronisation service.
 
 Reads all documents from each DMS client, splits their text into chunks,
-generates embeddings via an EmbedClient, and upserts the resulting vectors
+generates embeddings via an LLMClient, and upserts the resulting vectors
 into each RAG backend with a generic metadata payload.
 """
 
@@ -12,7 +12,7 @@ from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.models.Document import DocumentHighDetails
 from shared.clients.rag.RAGClientInterface import RAGClientInterface
 from shared.clients.rag.models.VectorPoint import VectorPoint
-from shared.clients.embed.EmbedClientInterface import EmbedClientInterface
+from shared.clients.llm.LLMClientInterface import LLMClientInterface
 from shared.helper.HelperConfig import HelperConfig
 
 CHUNK_SIZE = 1000       # characters per text chunk
@@ -68,7 +68,7 @@ class SyncService:
         helper_config: HelperConfig,
         dms_clients: list[DMSClientInterface],
         rag_clients: list[RAGClientInterface],
-        embed_client: EmbedClientInterface,
+        embed_client: LLMClientInterface,
     ) -> None:
         self.logging = helper_config.get_logger()
         self._dms_clients = dms_clients

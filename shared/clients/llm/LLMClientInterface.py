@@ -3,17 +3,20 @@ from abc import abstractmethod
 import httpx
 from typing import Tuple
 from shared.clients.ClientInterface import ClientInterface
-
 from shared.helper.HelperConfig import HelperConfig
 
-class EmbedClientInterface(ClientInterface):
+
+class LLMClientInterface(ClientInterface):
     def __init__(self, helper_config: HelperConfig):
         super().__init__(helper_config=helper_config)
 
-        # model and embedding config
+        # embedding config
         self.embed_distance = helper_config.get_string_val(f"{self.get_client_type().upper()}_DISTANCE", default="Cosine")
         self.embed_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_MODEL", default=None)
         self.embed_model_max_chars = helper_config.get_number_val(f"{self.get_client_type().upper()}_MODEL_MAX_CHARS", default=None)
+
+        # chat / completion config
+        self.chat_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_CHAT_MODEL", default=None)
 
     ##########################################
     ############### CHECKER ##################
@@ -25,49 +28,27 @@ class EmbedClientInterface(ClientInterface):
 
     ################ GENERAL ##################
     def _get_client_type(self) -> str:
-        """
-        Returns the type of the client. E.g. "rag"
-        """
-        return "embed"
-    
+        return "llm"
+
     ################ ENDPOINTS ##################
     @abstractmethod
     def _get_endpoint_models(self) -> str:
-        """
-        Returns the endpoint path for model listing requests.
-
-        Returns:
-            str: The endpoint path for model listing requests (e.g. "/api/tags")
-
-        Raises:
-            NotImplementedError: If the method is not implemented in a subclass.
-        """
+        """Returns the endpoint path for model listing requests (e.g. "/api/tags")."""
         pass
 
     @abstractmethod
     def get_endpoint_embedding(self) -> str:
-        """
-        Returns the endpoint path for embedding requests.
-
-        Returns:
-            str: The endpoint path for embedding requests (e.g. "/api/embed")
-
-        Raises:
-            NotImplementedError: If the method is not implemented in a subclass.
-        """
+        """Returns the endpoint path for embedding requests (e.g. "/api/embed")."""
         pass
 
     @abstractmethod
     def get_endpoint_model_details(self) -> str:
-        """
-        Returns the endpoint path for model details requests.
+        """Returns the endpoint path for model details requests (e.g. "/api/show")."""
+        pass
 
-        Returns:
-            str: The endpoint path for model details requests (e.g. "/api/show")
-
-        Raises:
-            NotImplementedError: If the method is not implemented in a subclass.
-        """
+    @abstractmethod
+    def _get_endpoint_chat(self) -> str:
+        """Returns the endpoint path for chat/completion requests (e.g. "/api/chat")."""
         pass
 
     ################ PAYLOAD BUILDER ##################
@@ -80,9 +61,19 @@ class EmbedClientInterface(ClientInterface):
 
         Returns:
             dict: JSON-serialisable request body (e.g. {"model": "...", "input": [...]}).
+        """
+        pass
 
-        Raises:
-            NotImplementedError: If the method is not implemented in a subclass.
+    @abstractmethod
+    def get_chat_payload(self, messages: list[dict]) -> dict:
+        """Build the backend-specific request body for a chat/completion request.
+
+        Args:
+            messages (list[dict]): OpenAI-format messages
+                (e.g. [{"role": "user", "content": "..."}]).
+
+        Returns:
+            dict: JSON-serialisable request body.
         """
         pass
 
@@ -92,16 +83,13 @@ class EmbedClientInterface(ClientInterface):
 
     @abstractmethod
     def extract_vector_size_from_model_info(self, model_info: dict) -> int:
-        """
-        Extracts the embedding vector size from the model information response.
+        """Extracts the embedding vector size from the model information response.
 
         Args:
             model_info (dict): The raw response from the model details endpoint.
+
         Returns:
             int: The dimension of the embedding vectors produced by the model.
-        Raises:
-            Exception: If the response format is invalid or the vector size cannot be determined.
-            NotImplementedError: If the method is not implemented in a subclass.
         """
         pass
 
@@ -118,10 +106,18 @@ class EmbedClientInterface(ClientInterface):
 
         Returns:
             list[list[float]]: Embedding vectors in the same order as the input texts.
+        """
+        pass
 
-        Raises:
-            ValueError: If the response format is invalid or embeddings are empty.
-            NotImplementedError: If the method is not implemented in a subclass.
+    @abstractmethod
+    def extract_chat_response(self, response_data: dict) -> str:
+        """Extract the assistant reply text from a raw chat API response.
+
+        Args:
+            response_data (dict): The parsed JSON response body.
+
+        Returns:
+            str: The assistant reply text.
         """
         pass
 
@@ -130,24 +126,14 @@ class EmbedClientInterface(ClientInterface):
     ##########################################
 
     async def do_fetch_models(self) -> httpx.Response:
-        """Fetch the list of available embedding models from the backend.
-
-        Returns:
-            httpx.Response: The response containing the model list.
-        """
+        """Fetch the list of available models from the backend."""
         return await self.do_request(method="GET", endpoint=self._get_endpoint_models())
 
     async def do_fetch_embedding_vector_size(self) -> Tuple[int, str]:
-        """
-        Fetch the output vector dimension and distance metric of the configured embedding model.
+        """Fetch the output vector dimension and distance metric of the configured embedding model.
 
         Returns:
-            Tuple[int, str]: The number of dimensions produced by the embedding model and the distance metric.
-
-        Raises:
-            Exception: If the backend cannot be reached or the dimension cannot be
-                determined from the response.
-            NotImplementedError: If the method is not implemented in a subclass.
+            Tuple[int, str]: (vector_dimension, distance_metric)
         """
         response = await self.do_request(
             method="POST",
@@ -161,19 +147,11 @@ class EmbedClientInterface(ClientInterface):
     async def do_embed(self, texts: list[str] | str) -> list[list[float]]:
         """Send an embedding request and return the extracted vectors.
 
-        Normalises the input to a list, builds the backend-specific payload via
-        get_embed_payload(), sends the request, validates the status, and extracts
-        the vectors via extract_embeddings_from_response().
-
         Args:
             texts (list[str] | str): One or more texts to embed.
 
         Returns:
             list[list[float]]: Embedding vectors in the same order as the inputs.
-
-        Raises:
-            Exception: If the HTTP request fails (status != 200).
-            ValueError: If the response does not contain valid embeddings.
         """
         texts = [texts] if isinstance(texts, str) else texts
         body = self.get_embed_payload(texts)
@@ -186,3 +164,26 @@ class EmbedClientInterface(ClientInterface):
             )
             raise Exception("Embedding request failed with status %d." % response.status_code)
         return self.extract_embeddings_from_response(response.json())
+
+    async def do_chat(self, messages: list[dict]) -> str:
+        """Send a chat/completion request and return the assistant reply text.
+
+        Args:
+            messages (list[dict]): OpenAI-format messages
+                (e.g. [{"role": "user", "content": "..."}]).
+
+        Returns:
+            str: The assistant reply text.
+
+        Raises:
+            Exception: If the HTTP request fails.
+            ValueError: If the response does not contain a valid reply.
+        """
+        body = self.get_chat_payload(messages)
+        response = await self.do_request(
+            method="POST",
+            endpoint=self._get_endpoint_chat(),
+            json=body,
+            raise_on_error=True,
+        )
+        return self.extract_chat_response(response.json())
