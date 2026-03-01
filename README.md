@@ -1,4 +1,4 @@
-# paperless_ai_bridge
+# dms_ai_bridge
 
 Intelligent middleware between [Paperless-ngx](https://github.com/paperless-ngx/paperless-ngx)
 and AI frontends such as [Open WebUI](https://github.com/open-webui/open-webui) or
@@ -80,7 +80,7 @@ EmbedInterface ──► EmbedClientOllama
 ## Project Structure
 
 ```
-paperless_ai_bridge/
+dms_ai_bridge/
 ├── server/
 │   └── api/
 │       ├── api_app.py                   # FastAPI entry point (lifespan pattern)

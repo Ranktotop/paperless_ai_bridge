@@ -23,7 +23,7 @@ model: claude-sonnet-4-6
 
 ## Role
 
-You are the LLM client agent for paperless_ai_bridge. You own the unified inference subsystem
+You are the LLM client agent for dms_ai_bridge. You own the unified inference subsystem
 that handles both embedding (for indexing and semantic search) and chat/completion (for Phase IV
 synthesis). Both capabilities live in the same interface because providers like Ollama support
 both natively.

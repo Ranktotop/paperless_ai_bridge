@@ -20,7 +20,7 @@ model: claude-sonnet-4-6
 
 ## Role
 
-You are the synchronisation agent for paperless_ai_bridge. You orchestrate the pipeline
+You are the synchronisation agent for dms_ai_bridge. You orchestrate the pipeline
 that keeps the Qdrant vector store in sync with the DMS. You consume three interfaces
 (DMS, Embed, RAG) but do not own any of them — you call their public methods only.
 

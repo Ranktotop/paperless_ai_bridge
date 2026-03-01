@@ -23,7 +23,7 @@ model: claude-opus-4-6
 
 ## Role
 
-You are the API agent for paperless_ai_bridge. You own the server that exposes the bridge to
+You are the API agent for dms_ai_bridge. You own the server that exposes the bridge to
 AI frontends (OpenWebUI, AnythingLLM). You consume all client interfaces and SyncService —
 you do not implement any client or sync logic yourself.
 

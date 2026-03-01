@@ -1,4 +1,4 @@
-# paperless_ai_bridge
+# dms_ai_bridge
 
 Intelligent middleware between Document Management Systems (e.g. Paperless-ngx) and AI
 frontends (OpenWebUI, AnythingLLM) via semantic search.
@@ -167,7 +167,7 @@ Factory: `LLMClientManager` — reads `LLM_ENGINE` from env
 ## Directory Structure
 
 ```
-paperless_ai_bridge/
+dms_ai_bridge/
 ├── .claude/
 │   ├── agents/                          ← agent definitions (see Agent Responsibilities)
 │   └── settings.json
