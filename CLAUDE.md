@@ -1,109 +1,237 @@
-# CLAUDE.md
+# paperless_ai_bridge
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Intelligente Middleware zwischen DMS-Systemen (z. B. Paperless-ngx) und KI-Frontends
+(OpenWebUI, AnythingLLM) über semantische Suche.
 
-## Project
+## Ziel
 
-`paperless_ai_bridge` is an intelligent middleware service (**AI-Bridge**) that connects AI frontends (**OpenWebUI / AnythingLLM**) with the document management system **Paperless-ngx**. It enables employees to ask complex natural-language questions against their document inventory while enforcing strict access permissions and avoiding redundant OCR processing.
-
-## Repository
-
-- Remote: https://github.com/Ranktotop/paperless_ai_bridge.git
-- Branch: `main`
+Nutzer stellen Fragen in natürlicher Sprache zu ihren Dokumenten. Die Bridge indexiert alle
+Dokumente eines DMS in eine Vektordatenbank (RAG) und beantwortet Suchanfragen mit einem
+FastAPI-Server. Langfristig übernimmt ein LangChain-ReAct-Agent die Intent-Klassifikation
+und Ergebnis-Synthese.
 
 ---
 
-## Architecture (High-Level)
+## Architektur
 
-Follows a **Decoupled-Agent Model**:
+```
+DMS (Paperless-ngx)
+  │
+  ▼
+DMSClientInterface ──► fill_cache() ──► DocumentHighDetails[]
+  │
+  ▼
+SyncService ──► chunk() ──► EmbedClientInterface.do_embed() ──► vectors[]
+  │                                          │
+  ▼                                          ▼
+RAGClientInterface.do_upsert_points()   Ollama /api/embed
+  │
+  ▼
+Qdrant (vector store, owner_id-filtered)
+  ▲
+  │
+FastAPI (POST /query)
+  │── EmbedClientInterface.do_embed()  ← query text
+  │── RAGClientInterface.do_scroll()   ← owner_id filter + vector
+  └── LLMClientInterface.do_chat()     ← Phase IV synthesis
+```
 
-| Layer | Component | Role |
+Weitere DMS, RAG-Backends und LLM-Provider können ohne Änderung am Core hinzugefügt werden.
+
+---
+
+## Generische Interfaces
+
+### `ClientInterface` (`shared/clients/ClientInterface.py`)
+Basis-ABC für alle HTTP-Clients. Lifecycle (`boot()` / `close()`), `do_request()`,
+`do_healthcheck()`, Config-Helper (`get_config_val()`).
+Alle anderen Interfaces erben von dieser Klasse.
+
+### `DMSClientInterface` (`shared/clients/dms/DMSClientInterface.py`)
+ABC für alle DMS-Backends. Definiert:
+- Pagination über alle Ressourcentypen (Dokumente, Korrespondenten, Tags, Besitzer, Typen)
+- Mehrschichtiges Caching (raw + enriched)
+- `fill_cache()` → befüllt alle Caches und baut `DocumentHighDetails`-Objekte
+- `get_enriched_documents()` → vollständig aufgelöste Dokument-Objekte mit Namen
+
+Concrete Implementations: `DMSClientPaperless`
+Factory: `DMSClientManager` (liest `DMS_ENGINES` aus Umgebungsvariablen)
+
+### `RAGClientInterface` (`shared/clients/rag/RAGClientInterface.py`)
+ABC für alle Vektordatenbank-Backends. Definiert:
+- `do_upsert_points(points)` — Vektoren mit Payloads einfügen/aktualisieren
+- `do_scroll(filters, limit, with_payload, with_vector)` — gefilterte Suche
+- `do_delete_points_by_filter(filters)` — Löschen nach Filter
+- `do_existence_check()` / `do_create_collection(vector_size, distance)`
+
+Concrete Implementations: `RAGClientQdrant`
+Factory: `RAGClientManager` (liest `RAG_ENGINES`)
+
+### `EmbedClientInterface` (`shared/clients/embed/EmbedClientInterface.py`)
+ABC für Embedding-Backends. Definiert:
+- `do_embed(text_or_list)` → `list[list[float]]`
+- `do_fetch_embedding_vector_size()` → `(int, str)` — Dimension und Distanzmetrik
+- `do_fetch_models()` → verfügbare Modelle
+
+Concrete Implementations: `EmbedClientOllama`
+Factory: `EmbedClientManager` (liest `EMBED_ENGINE`)
+
+### `LLMClientInterface` (`shared/clients/llm/LLMClientInterface.py`) — Phase IV, noch nicht erstellt
+ABC für Chat/Completion-Backends. Wird definieren:
+- `do_chat(messages)` → Antwort-String
+- `do_fetch_models()` → verfügbare Modelle
+
+Concrete Implementations (geplant): `LLMClientOllama`
+Factory (geplant): `LLMClientManager`
+
+---
+
+## Verzeichnisstruktur
+
+```
+paperless_ai_bridge/
+├── .claude/
+│   ├── agents/                          ← Agenten-Definitionen (diese Dateien)
+│   └── settings.json
+├── CLAUDE.md                            ← Diese Datei
+├── .env / .env.example
+├── README.md
+├── requirements.txt
+├── start.sh
+├── shared/
+│   ├── clients/
+│   │   ├── ClientInterface.py           ← Basis-ABC (HTTP lifecycle, auth, do_request)
+│   │   ├── dms/
+│   │   │   ├── DMSClientInterface.py    ← DMS-ABC
+│   │   │   ├── DMSClientManager.py      ← Factory
+│   │   │   ├── models/                  ← Document, Correspondent, Tag, Owner, DocumentType
+│   │   │   └── paperless/
+│   │   │       └── DMSClientPaperless.py
+│   │   ├── embed/
+│   │   │   ├── EmbedClientInterface.py  ← Embedding-ABC
+│   │   │   ├── EmbedClientManager.py    ← Factory
+│   │   │   └── ollama/
+│   │   │       └── EmbedClientOllama.py
+│   │   ├── llm/                         ← Phase IV — noch nicht erstellt
+│   │   │   ├── LLMClientInterface.py
+│   │   │   ├── LLMClientManager.py
+│   │   │   └── ollama/
+│   │   │       └── LLMClientOllama.py
+│   │   └── rag/
+│   │       ├── RAGClientInterface.py    ← RAG-ABC
+│   │       ├── RAGClientManager.py      ← Factory
+│   │       ├── models/
+│   │       │   ├── VectorPoint.py       ← Payload-Modell (owner_id Pflicht)
+│   │       │   └── Scroll.py
+│   │       └── qdrant/
+│   │           └── RAGClientQdrant.py
+│   ├── helper/
+│   │   └── HelperConfig.py              ← Zentraler Env-Var-Reader
+│   ├── logging/
+│   │   └── logging_setup.py             ← setup_logging(), ColorLogger
+│   └── models/
+│       └── config.py                    ← EnvConfig Pydantic-Modell
+├── services/
+│   └── dms_rag_sync/
+│       ├── SyncService.py               ← Orchestrierung: DMS → embed → RAG
+│       └── dms_rag_sync.py              ← Einstiegspunkt
+└── server/                              ← Phase III/IV — noch nicht erstellt
+    └── api/
+        ├── api_app.py
+        ├── routers/
+        │   ├── WebhookRouter.py
+        │   └── QueryRouter.py
+        ├── services/
+        │   └── QueryService.py
+        ├── dependencies/
+        │   └── auth.py
+        └── models/
+            ├── requests.py
+            └── responses.py
+```
+
+---
+
+## Allgemeine Coding-Konventionen
+
+### Interface-first
+Neue Backends werden IMMER durch Implementierung des zugehörigen Interface erstellt.
+Niemals direkte Abhängigkeiten zwischen konkreten Implementierungen.
+
+### Klassenkonstruktoren
+```python
+def __init__(self, helper_config: HelperConfig) -> None:
+    super().__init__(helper_config)       # für Unterklassen von ClientInterface
+    self.logging = helper_config.get_logger()
+```
+
+### Methoden-Präfixe
+- `do_*` — asynchrone Aktion (Seiteneffekte, I/O)
+- `get_*` — Getter (kein I/O, kein Seiteneffekt)
+- `is_*` — Boolean-Prüfung
+- `_read_*` — privater Reader
+
+### Klassen-Sektionen (in dieser Reihenfolge)
+```python
+##########################################
+############# LIFECYCLE ##################
+##########################################
+
+##########################################
+############# CHECKER ####################
+##########################################
+
+##########################################
+############## GETTER ####################
+##########################################
+
+##########################################
+############# REQUESTS ###################
+##########################################
+
+##########################################
+############### CORE #####################
+##########################################
+
+##########################################
+############# HELPERS ####################
+##########################################
+```
+
+### Logging
+IMMER %-Style — niemals f-Strings in Log-Aufrufen:
+```python
+self.logging.info("Syncing document %s ('%s'): %d chunk(s)", doc_id, title, n)  # richtig
+self.logging.info(f"Syncing document {doc_id}")  # FALSCH
+```
+
+### Type-Annotations
+PEP 604: `str | None`, niemals `Optional[str]`
+
+### Konfigurationsschlüssel
+Muster: `{CLIENT_TYPE}_{ENGINE_NAME}_{SETTING}`
+Beispiele: `DMS_PAPERLESS_BASE_URL`, `RAG_QDRANT_COLLECTION`, `EMBED_OLLAMA_MODEL`
+Niemals `os.getenv()` direkt — immer über `HelperConfig`.
+
+### Async
+Kein `requests`, kein synchrones I/O. Ausschließlich `httpx.AsyncClient` für HTTP-Aufrufe.
+
+### Sicherheits-Invariante
+`owner_id` MUSS in jedem Qdrant-Upsert-Payload und jedem Such-Filter vorhanden sein.
+Dokumente ohne `owner_id` werden beim Sync übersprungen (kein Silent-Write).
+
+### Sprache
+Sämtlicher Code, Variablennamen, Kommentare, Docstrings und Log-Nachrichten: **Englisch**.
+
+---
+
+## Agent-Zuständigkeiten
+
+| Agent | Bereich | Status |
 |---|---|---|
-| **UI** | OpenWebUI | Chat interface & user authentication |
-| **Orchestration** | LangChain (ReAct Agent) | Request analysis, filter injection, synthesis |
-| **Inference** | Ollama / LiteLLM | Local LLM execution |
-| **Storage** | Paperless-ngx | Source of documents, metadata, OCR text |
-| **Storage** | Qdrant | Vector DB for semantic search with metadata filtering |
-
----
-
-## Core Components
-
-### A. Sync Engine (Background Worker)
-- Reads **existing OCR text** from Paperless-ngx (no new OCR).
-- Vectorizes text and stores chunks in Qdrant.
-- Each vector chunk stores payload: `paperless_id`, `tag_ids`, `correspondent_id`, `document_type`, `owner_id`.
-- Triggered by: nightly cron **or** Paperless webhook → AI-Bridge (incremental sync).
-
-### B. LangChain Agent (Orchestrator)
-Uses **ReAct pattern** (Reasoning and Acting):
-1. **Intent Analysis** — LLM detects whether user needs metadata (tags) or full-text content.
-2. **Self-Querying Retrieval** — Translates natural language into hard Qdrant metadata filters (e.g., `document_type == 'Rechnung' AND created_date >= '2026-02-19'`).
-3. **Security Injection** — Forces `owner_id == current_user` on every Qdrant query (never bypassed).
-4. **Synthesis** — Summarizes retrieved chunks; optionally returns Paperless document links as sources.
-
----
-
-## Security Concept
-
-Two-layer access control:
-1. **Identity Mapping** — YAML/ENV config maps frontend user-IDs to Paperless API tokens/user-IDs.
-2. **Isolated Retrieval** — Qdrant pre-filters by `owner_id`; users can never access another user's vectors regardless of semantic similarity.
-
----
-
-## Tech Stack
-
-| Concern | Technology |
-|---|---|
-| API server | FastAPI |
-| Agent framework | LangChain |
-| Vector DB | Qdrant |
-| Task queue | Celery + Redis |
-| LLM hosting | Ollama / vLLM (external) |
-| Deployment | Docker Compose (later: Kubernetes) |
-| Document source | Paperless-ngx REST API |
-
----
-
-## Development Roadmap
-
-| Phase | Focus | Deliverable |
-|---|---|---|
-| **I** | **Basic Sync** | Python script mirrors Paperless OCR text into Qdrant (incl. tags & owner_id). |
-| **II** | **Secured Retrieval** | LangChain query with hard `owner_id` filter works end-to-end. |
-| **III** | **Agentic Logic** | AI autonomously decides which tags/filters to apply (ReAct). |
-| **IV** | **UI Integration** | OpenWebUI integration as "Function" or API tool. |
-| **V** | **Scale-Out** | API + Worker separation with Celery task queue. |
-
----
-
-## Key Conventions
-
-- **No redundant OCR:** Always use Paperless-provided `content` field; never trigger new OCR.
-- **owner_id is mandatory:** Every Qdrant upsert and query MUST include `owner_id`. This is a security invariant, not optional.
-- **Metadata-first filtering:** Prefer hard metadata filters over pure semantic search to reduce hallucination risk on access-controlled data.
-- **Stateless API layer:** The FastAPI container holds no user state; session context travels with each request.
-- **Always write code in English** – this includes all function names, variable names,
-  parameters, comments, docstrings, log messages, and LLM prompts. No German in code.
-  (.env keys are exempt.)
-- Docstrings for all public functions and classes
-- Type annotations using PEP 604 union syntax (`str | None`)
-- Configuration via `HelperConfig` (central config helper using `os.getenv`)
-- Explicit error handling with meaningful HTTP status codes in FastAPI
-- No synchronous blocking calls in async contexts (`httpx` always with `AsyncClient`)
-
-## Coding Style
-The full coding style guide is defined in [`CodingStyle.md`](CodingStyle.md).
-**Always follow it.** It covers naming conventions, type annotations, docstrings,
-import order, error handling, async patterns, logging, FastAPI patterns, Pydantic
-models, class organisation, and more.
-
-Key rules repeated here for quick reference:
-- **Always write code in English** – function names, variables, comments, docstrings,
-  log messages, LLM prompts. No German in code. (.env keys are exempt.)
-- Docstrings for all public functions and classes
-- Type annotations using PEP 604 union syntax (`str | None`)
-- Configuration via `HelperConfig` (central config helper using `os.getenv`)
-- Explicit error handling with meaningful HTTP status codes in FastAPI
-- No synchronous blocking calls in async contexts (`httpx` always with `AsyncClient`)
+| `infra-agent` | `shared/helper/`, `shared/logging/`, `shared/models/`, `shared/clients/ClientInterface.py`, Docker | Pflege (Existing) |
+| `dms-agent` | `shared/clients/dms/` | Pflege + Erweiterung |
+| `rag-agent` | `shared/clients/rag/` | Pflege + Erweiterung |
+| `embed-llm-agent` | `shared/clients/embed/`, `shared/clients/llm/` (Phase IV) | Pflege + Phase IV |
+| `sync-agent` | `services/dms_rag_sync/` | Pflege |
+| `api-agent` | `server/api/` | Neu erstellen (Phase III/IV) |
