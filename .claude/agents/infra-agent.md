@@ -38,7 +38,7 @@ or ClientInterface without coordinating with all dependent agents first.
 - `start.sh`
 
 **Read-only reference:**
-- All files in `shared/clients/dms/`, `shared/clients/rag/`, `shared/clients/embed/` —
+- All files in `shared/clients/dms/`, `shared/clients/rag/`, `shared/clients/llm/` —
   understand how they use ClientInterface, but do not modify them
 
 ## Interfaces and Classes in Scope
@@ -92,6 +92,6 @@ Follow all conventions in CLAUDE.md. Additional rules for this agent:
 **Coordination protocol:**
 - If you change `HelperConfig` public method signatures, notify all agents before merging
 - If you add abstract methods to `ClientInterface`, all existing subclasses
-  (DMSClientPaperless, RAGClientQdrant, EmbedClientOllama) must be updated in the same commit
+  (DMSClientPaperless, RAGClientQdrant, LLMClientOllama) must be updated in the same commit
 - requirements.txt changes: run `pip install -r requirements.txt` in `.venv` and verify
   no conflicts before finalising

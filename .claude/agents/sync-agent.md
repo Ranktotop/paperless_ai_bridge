@@ -34,7 +34,7 @@ that keeps the Qdrant vector store in sync with the DMS. You consume three inter
 - `shared/clients/dms/DMSClientInterface.py` — `fill_cache()`, `get_enriched_documents()`
 - `shared/clients/rag/RAGClientInterface.py` — `do_upsert_points()`, `do_scroll()`,
   `do_delete_points_by_filter()`, `do_create_collection()`, `do_existence_check()`
-- `shared/clients/embed/EmbedClientInterface.py` — `do_embed()`, `do_fetch_embedding_vector_size()`
+- `shared/clients/llm/LLMClientInterface.py` — `do_embed()`, `do_fetch_embedding_vector_size()`
 - `shared/clients/rag/models/VectorPoint.py` — payload model for upsert
 - `shared/clients/dms/models/Document.py` — `DocumentHighDetails` input type
 - `shared/helper/HelperConfig.py` and `shared/logging/logging_setup.py`
@@ -57,7 +57,7 @@ class SyncService:
         helper_config: HelperConfig,
         dms_clients: list[DMSClientInterface],
         rag_clients: list[RAGClientInterface],
-        embed_client: EmbedClientInterface,
+        embed_client: LLMClientInterface,
     ) -> None:
         self.logging = helper_config.get_logger()
         ...
@@ -111,7 +111,7 @@ Follow all conventions in CLAUDE.md. Additional rules for this agent:
 **This agent consumes:**
 - dms-agent: `DMSClientInterface.fill_cache()`, `get_enriched_documents()`
 - rag-agent: `RAGClientInterface.*`, `VectorPoint` model
-- embed-llm-agent: `EmbedClientInterface.do_embed()`, `do_fetch_embedding_vector_size()`
+- embed-llm-agent: `LLMClientInterface.do_embed()`, `do_fetch_embedding_vector_size()`
 - infra-agent: `HelperConfig`, `setup_logging()`
 
 **Coordination points:**

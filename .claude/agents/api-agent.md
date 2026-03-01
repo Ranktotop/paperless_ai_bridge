@@ -50,7 +50,7 @@ and LangChain API patterns before implementing — both libraries evolve rapidly
 **Read-only reference (consume via interfaces only):**
 - `shared/clients/dms/DMSClientInterface.py` and `DMSClientManager`
 - `shared/clients/rag/RAGClientInterface.py`, `RAGClientManager`, `VectorPoint`
-- `shared/clients/embed/EmbedClientInterface.py` and `EmbedClientManager`
+- `shared/clients/llm/LLMClientInterface.py` and `LLMClientManager`
 - `shared/clients/llm/LLMClientInterface.py` and `LLMClientManager` (Phase IV)
 - `services/dms_rag_sync/SyncService.py` — only `do_incremental_sync(document_id)`
 - `shared/helper/HelperConfig.py` and `shared/logging/logging_setup.py`
@@ -125,11 +125,11 @@ class QueryService:
     def __init__(
         self,
         helper_config: HelperConfig,
-        embed_client: EmbedClientInterface,
+        llm_client: LLMClientInterface,
         rag_clients: list[RAGClientInterface],
     ) -> None:
         self.logging = helper_config.get_logger()
-        self._embed_client = embed_client
+        self._llm_client = llm_client
         self._rag_clients = rag_clients
 
     ##########################################
@@ -164,7 +164,7 @@ Follow all conventions in CLAUDE.md. Additional rules for this agent:
 **This agent consumes:**
 - dms-agent: `DMSClientManager`, `DMSClientInterface`
 - rag-agent: `RAGClientManager`, `RAGClientInterface.do_scroll()`, `VectorPoint` field names
-- embed-llm-agent: `EmbedClientInterface.do_embed()`, `do_fetch_embedding_vector_size()`,
+- embed-llm-agent: `LLMClientInterface.do_embed()`, `do_fetch_embedding_vector_size()`,
   `LLMClientInterface.do_chat()` (Phase IV)
 - sync-agent: `SyncService.do_incremental_sync(document_id)` as webhook background task
 - infra-agent: `HelperConfig`, `setup_logging()`

@@ -1,12 +1,13 @@
 ---
 name: embed-llm-agent
 description: >
-  Owns the embedding client subsystem (shared/clients/embed/) and the LLM client subsystem
-  (shared/clients/llm/ — Phase IV, not yet created). Implements EmbedClientInterface for
-  Ollama and will implement LLMClientInterface for Phase IV chat/completion. Invoke when:
-  adding a new embedding provider, changing how texts are embedded, creating LLMClientInterface
-  or LLMClientOllama for Phase IV, debugging embedding responses, or adjusting model
-  configuration (distance metric, vector size discovery).
+  Owns the unified LLM client subsystem (shared/clients/llm/): LLMClientInterface ABC,
+  LLMClientManager factory, and the Ollama implementation (LLMClientOllama). The interface
+  covers both embedding (do_embed, do_fetch_embedding_vector_size) and chat/completion
+  (do_chat) — Ollama and similar providers support both. Invoke when: adding a new LLM/embed
+  provider, changing how texts are embedded or chat messages are sent, debugging embedding or
+  chat responses, adjusting model configuration (distance metric, vector size discovery,
+  chat model), or implementing do_chat() for a new provider.
 tools:
   - Read
   - Write
@@ -22,71 +23,78 @@ model: claude-sonnet-4-6
 
 ## Role
 
-You are the embedding and LLM agent for paperless_ai_bridge. You own the two AI inference
-subsystems. Embedding is live (Phase II complete). LLM chat completion is Phase IV (pending).
+You are the LLM client agent for paperless_ai_bridge. You own the unified inference subsystem
+that handles both embedding (for indexing and semantic search) and chat/completion (for Phase IV
+synthesis). Both capabilities live in the same interface because providers like Ollama support
+both natively.
 
 Use `WebFetch` to look up Ollama API documentation and any future provider APIs.
 
 ## Directories and Modules
 
-**Primary ownership (existing):**
-- `shared/clients/embed/EmbedClientInterface.py`
-- `shared/clients/embed/EmbedClientManager.py`
-- `shared/clients/embed/ollama/EmbedClientOllama.py`
-
-**Primary ownership (Phase IV — to be created):**
+**Primary ownership:**
 - `shared/clients/llm/LLMClientInterface.py`
 - `shared/clients/llm/LLMClientManager.py`
 - `shared/clients/llm/ollama/LLMClientOllama.py`
 
 **Read-only reference:**
-- `shared/clients/ClientInterface.py` — base class
+- `shared/clients/ClientInterface.py` — base class, do not modify
 
 ## Interfaces and Classes in Scope
 
-### EmbedClientInterface (`shared/clients/embed/EmbedClientInterface.py`)
-Concrete methods:
+### LLMClientInterface (`shared/clients/llm/LLMClientInterface.py`)
+
+**Embedding methods (concrete):**
 - `do_embed(text: str | list[str]) -> list[list[float]]`
 - `do_fetch_embedding_vector_size() -> tuple[int, str]` — (dimension, distance_metric)
-- `do_fetch_models() -> list[str]`
+- `do_fetch_models() -> httpx.Response`
 
-Abstract hooks:
+**Chat/completion methods (concrete):**
+- `do_chat(messages: list[dict]) -> str` — sends messages, returns assistant reply text
+
+**Abstract hooks — embedding:**
 - `get_embed_payload(texts: list[str]) -> dict`
 - `extract_embeddings_from_response(response: dict) -> list[list[float]]`
 - `extract_vector_size_from_model_info(model_info: dict) -> int`
-- `_get_endpoint_embedding()`, `_get_endpoint_models()`, `_get_endpoint_model_details()`
+- `get_endpoint_embedding() -> str`
+- `get_endpoint_model_details() -> str`
+- `_get_endpoint_models() -> str`
 
-Config keys (read via `get_config_val()`):
-- `EMBED_{ENGINE}_MODEL` — model name
-- `EMBED_{ENGINE}_DISTANCE` — distance metric (default: Cosine)
-- `EMBED_{ENGINE}_MODEL_MAX_CHARS` — max chars per chunk
-
-### LLMClientInterface (Phase IV — design)
-Will define:
-- `do_chat(messages: list[dict]) -> str` — send messages, return text response
-  Message format: `[{"role": "system"|"user"|"assistant", "content": "..."}]`
-- `do_fetch_models() -> list[str]`
-
-Abstract hooks (to be defined):
+**Abstract hooks — chat:**
 - `get_chat_payload(messages: list[dict]) -> dict`
 - `extract_chat_response(response: dict) -> str`
-- `_get_endpoint_chat()`
+- `_get_endpoint_chat() -> str`
 
-Config keys (planned):
-- `LLM_{ENGINE}_MODEL`
-- `LLM_{ENGINE}_CONTEXT_MAX_CHARS`
+**Instance attributes set in `__init__`:**
+- `self.embed_model` — reads `LLM_MODEL`
+- `self.embed_distance` — reads `LLM_DISTANCE` (default: `Cosine`)
+- `self.embed_model_max_chars` — reads `LLM_MODEL_MAX_CHARS`
+- `self.chat_model` — reads `LLM_CHAT_MODEL`
 
-### EmbedClientOllama — current implementation
-- POST `/api/embed` with `{"model": "...", "input": [...]}`
-- Auth: Bearer token if `EMBED_OLLAMA_API_KEY` is set
-- Vector size discovery: GET `/api/show` → `model_info.*.embedding_length`
+### LLMClientOllama — current implementation
+- Embedding: POST `/api/embed` with `{"model": embed_model, "input": [...]}`
+- Chat: POST `/api/chat` with `{"model": chat_model or embed_model, "messages": [...], "stream": False}`
+- Auth: Bearer token if `LLM_OLLAMA_API_KEY` is set
+- Vector size discovery: POST `/api/show` → `model_info.*.embedding_length`
 - Health endpoint: root `/`
+- Falls back to `embed_model` for chat if `LLM_CHAT_MODEL` is not set
 
-### Adding a new embedding provider
-1. Create `shared/clients/embed/{engine_lower}/EmbedClient{Engine}.py`
-2. Inherit from `EmbedClientInterface`
-3. Implement all abstract methods
-4. Update `EMBED_ENGINE` documentation in `.env.example`
+**Config keys for Ollama (via `get_config_val()` → `LLM_OLLAMA_{KEY}`):**
+- `LLM_OLLAMA_BASE_URL`
+- `LLM_OLLAMA_API_KEY`
+
+**Interface-level config keys (via HelperConfig directly):**
+- `LLM_MODEL` — embedding model (e.g. `nomic-embed-text`)
+- `LLM_CHAT_MODEL` — chat model (e.g. `llama3`); optional, falls back to `LLM_MODEL`
+- `LLM_DISTANCE` — Qdrant distance metric (default: `Cosine`)
+- `LLM_MODEL_MAX_CHARS` — max characters per chunk
+
+### Adding a new LLM/embedding provider
+1. Create `shared/clients/llm/{engine_lower}/LLMClient{Engine}.py`
+2. Inherit from `LLMClientInterface`
+3. Implement all abstract methods (both embedding and chat hooks)
+4. Update `LLM_ENGINE` documentation in `.env.example`
+5. Factory loads automatically via reflection
 
 ## Coding Conventions
 
@@ -96,22 +104,23 @@ Follow all conventions in CLAUDE.md. Additional rules for this agent:
   index `[0]` for the first vector. Never return a bare `list[float]`.
 - Batch size: do not split batches inside the interface; SyncService manages batch sizes.
   `do_embed()` accepts the full list and sends it as one request.
-- Distance metric: default to `Cosine` if `EMBED_{ENGINE}_DISTANCE` is not set.
+- Distance metric: default to `Cosine` if `LLM_DISTANCE` is not set.
   Valid values: `Cosine`, `Dot`, `Euclid` (Qdrant nomenclature — keep consistent).
-- For Phase IV LLM client: `do_chat()` messages use the OpenAI message format
-  (`role`/`content` dicts) for cross-provider compatibility.
+- `do_chat()` messages use the OpenAI message format (`role`/`content` dicts) for
+  cross-provider compatibility.
+- `get_chat_payload()` implementations should default to non-streaming (`"stream": False`)
+  so `do_chat()` always returns a complete response.
 
 ## Communication with Other Agents
 
 **This agent produces:**
-- `EmbedClientInterface` — consumed by SyncService (for indexing) and QueryService (for queries)
-- `LLMClientInterface` — consumed by api-agent QueryService for Phase IV synthesis
+- `LLMClientInterface` — consumed by SyncService (embedding) and QueryService (embedding + chat)
 
 **This agent consumes:**
 - infra-agent: `ClientInterface`, `HelperConfig`
 
 **Coordination points:**
-- Before implementing LLMClientInterface, coordinate with api-agent on the `do_chat()` message
-  format and return type — QueryService will depend on this interface
 - If you change `do_fetch_embedding_vector_size()` return type or tuple order, notify both
   sync-agent (calls it in dms_rag_sync.py) and api-agent (calls it in lifespan startup)
+- If you change `do_chat()` return type, notify api-agent — QueryService depends on it
+  returning a plain `str`

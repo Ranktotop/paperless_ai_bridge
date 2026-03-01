@@ -21,7 +21,7 @@ DMS (Paperless-ngx)
 DMSClientInterface ──► fill_cache() ──► DocumentHighDetails[]
   │
   ▼
-SyncService ──► chunk() ──► EmbedClientInterface.do_embed() ──► vectors[]
+SyncService ──► chunk() ──► LLMClientInterface.do_embed() ──► vectors[]
   │                                          │
   ▼                                          ▼
 RAGClientInterface.do_upsert_points()   Ollama /api/embed
@@ -31,7 +31,7 @@ Qdrant (vector store, owner_id-filtered)
   ▲
   │
 FastAPI (POST /query)
-  │── EmbedClientInterface.do_embed()  ← query text
+  │── LLMClientInterface.do_embed()    ← query text
   │── RAGClientInterface.do_scroll()   ← owner_id filter + vector
   └── LLMClientInterface.do_chat()     ← Phase IV synthesis
 ```
@@ -67,22 +67,16 @@ ABC für alle Vektordatenbank-Backends. Definiert:
 Concrete Implementations: `RAGClientQdrant`
 Factory: `RAGClientManager` (liest `RAG_ENGINES`)
 
-### `EmbedClientInterface` (`shared/clients/embed/EmbedClientInterface.py`)
-ABC für Embedding-Backends. Definiert:
+### `LLMClientInterface` (`shared/clients/llm/LLMClientInterface.py`)
+Unified ABC für Embedding- und Chat/Completion-Backends. Definiert:
 - `do_embed(text_or_list)` → `list[list[float]]`
 - `do_fetch_embedding_vector_size()` → `(int, str)` — Dimension und Distanzmetrik
 - `do_fetch_models()` → verfügbare Modelle
-
-Concrete Implementations: `EmbedClientOllama`
-Factory: `EmbedClientManager` (liest `EMBED_ENGINE`)
-
-### `LLMClientInterface` (`shared/clients/llm/LLMClientInterface.py`) — Phase IV, noch nicht erstellt
-ABC für Chat/Completion-Backends. Wird definieren:
 - `do_chat(messages)` → Antwort-String
-- `do_fetch_models()` → verfügbare Modelle
 
-Concrete Implementations (geplant): `LLMClientOllama`
-Factory (geplant): `LLMClientManager`
+Concrete Implementations: `LLMClientOllama`
+Factory: `LLMClientManager` (liest `LLM_ENGINE`)
+
 
 ---
 
@@ -107,14 +101,9 @@ paperless_ai_bridge/
 │   │   │   ├── models/                  ← Document, Correspondent, Tag, Owner, DocumentType
 │   │   │   └── paperless/
 │   │   │       └── DMSClientPaperless.py
-│   │   ├── embed/
-│   │   │   ├── EmbedClientInterface.py  ← Embedding-ABC
-│   │   │   ├── EmbedClientManager.py    ← Factory
-│   │   │   └── ollama/
-│   │   │       └── EmbedClientOllama.py
-│   │   ├── llm/                         ← Phase IV — noch nicht erstellt
-│   │   │   ├── LLMClientInterface.py
-│   │   │   ├── LLMClientManager.py
+│   │   ├── llm/
+│   │   │   ├── LLMClientInterface.py    ← Unified ABC (embed + chat)
+│   │   │   ├── LLMClientManager.py      ← Factory
 │   │   │   └── ollama/
 │   │   │       └── LLMClientOllama.py
 │   │   └── rag/
@@ -210,7 +199,7 @@ PEP 604: `str | None`, niemals `Optional[str]`
 
 ### Konfigurationsschlüssel
 Muster: `{CLIENT_TYPE}_{ENGINE_NAME}_{SETTING}`
-Beispiele: `DMS_PAPERLESS_BASE_URL`, `RAG_QDRANT_COLLECTION`, `EMBED_OLLAMA_MODEL`
+Beispiele: `DMS_PAPERLESS_BASE_URL`, `RAG_QDRANT_COLLECTION`, `LLM_OLLAMA_BASE_URL`
 Niemals `os.getenv()` direkt — immer über `HelperConfig`.
 
 ### Async
@@ -232,6 +221,6 @@ Sämtlicher Code, Variablennamen, Kommentare, Docstrings und Log-Nachrichten: **
 | `infra-agent` | `shared/helper/`, `shared/logging/`, `shared/models/`, `shared/clients/ClientInterface.py`, Docker | Pflege (Existing) |
 | `dms-agent` | `shared/clients/dms/` | Pflege + Erweiterung |
 | `rag-agent` | `shared/clients/rag/` | Pflege + Erweiterung |
-| `embed-llm-agent` | `shared/clients/embed/`, `shared/clients/llm/` (Phase IV) | Pflege + Phase IV |
+| `embed-llm-agent` | `shared/clients/llm/` | Pflege + Erweiterung |
 | `sync-agent` | `services/dms_rag_sync/` | Pflege |
 | `api-agent` | `server/api/` | Neu erstellen (Phase III/IV) |
