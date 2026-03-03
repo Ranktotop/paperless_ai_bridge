@@ -6,6 +6,7 @@ from shared.helper.HelperConfig import HelperConfig
 
 # Key namespace constants — use these in all callers, never hardcode key strings
 KEY_FILTER_OPTIONS = "filter_options"
+KEY_INGESTION_FILE = "ingestion:file"
 
 
 class CacheClientInterface(ClientInterface):

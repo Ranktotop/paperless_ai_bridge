@@ -1,8 +1,8 @@
-"""
-Temporary PDF conversion for non-native document formats.
+"""Format conversion helper for the document ingestion pipeline.
 
-Converts office/document files to PDF if needed. 
-Note: use cleanup() to remove temporary files after processing.
+Converts office and document files to PDF using LibreOffice headless so that
+PyMuPDF and the Vision LLM can process them uniformly.  Native formats (PDF,
+images, plain text) are copied to the working directory without conversion.
 """
 import asyncio
 import logging
@@ -14,15 +14,28 @@ from uuid import uuid4
 from shared.helper.HelperConfig import HelperConfig
 
 class DocumentConverter:
-    """Converts non-native document formats to a temporary PDF for processing.
+    """Converts non-native document formats to a working-directory copy for processing.
 
-    Usage:
-        async with doc_helper.as_pdf(file_path) as pdf_path:
-            text = await ocr_helper.do_extract_text(pdf_path)
-        # pdf_path is cleaned up here; the original file is untouched.
+    Native formats (pdf, png, jpg, jpeg, txt, md) are copied as-is.
+    Convertible formats (docx, doc, odt, xlsx, …) are converted to PDF via
+    LibreOffice headless.  The original source file is never modified.
+
+    Lifecycle: ``boot()`` is called automatically in ``__init__``.  Call
+    ``cleanup()`` when processing is complete to remove the working directory.
     """
 
-    def __init__(self, helper_config: HelperConfig, working_directory:str) -> None:
+    def __init__(self, helper_config: HelperConfig, working_directory: str) -> None:
+        """Initialise the converter and create the working directory.
+
+        Args:
+            helper_config: Shared configuration and logger provider.
+            working_directory: Base path for temporary output files.  A
+                UUID-named subdirectory is created inside it.
+
+        Raises:
+            RuntimeError: If LibreOffice (``soffice`` or ``libreoffice``) is
+                not found in PATH, or if the working directory cannot be created.
+        """
         self.logging: logging.Logger = helper_config.get_logger()
         self._libreoffice: str | None = self._find_libreoffice()
         self._helper_file = HelperFile()
@@ -39,16 +52,19 @@ class DocumentConverter:
     ##########################################
 
     def boot(self) -> None:
+        """Create the working directory.  Called automatically in ``__init__``."""
         #create directory for converted files if it does not exist
         if not self._helper_file.create_folder(self._working_directory):
             raise RuntimeError(f"DocumentConverter: failed to create working directory '{self._working_directory}' for converted files")
 
     def cleanup(self) -> None:
+        """Remove the working directory and all converted files inside it."""
         #delete the working dir
         if not self._helper_file.remove_folder(self._working_directory):
             self.logging.warning(f"DocumentConverter: failed to delete working directory '{self._working_directory}' for converted files")
 
     def is_booted(self) -> bool:
+        """Return True if the working directory exists and LibreOffice is available."""
         return self._helper_file.folder_exists(self._working_directory) and self._libreoffice is not None
 
     def _find_libreoffice(self) -> str | None:
@@ -64,39 +80,35 @@ class DocumentConverter:
     ##########################################
 
     def _get_supported_extensions(self) -> list[str]:
-        """
-        Return a list of all file extensions which can be processed without conversion
-
-        Returns:
-            List of lowercase file extensions (including dot), e.g. [".pdf", ".png
-        """
+        """Return extensions that can be processed without conversion (e.g. ``pdf``, ``png``)."""
         return ["pdf", "png", "jpg", "jpeg", "txt", "md"]
-    
-    def _get_extensions_to_convert(self) -> list[str]:
-        """
-        Return a list of file extensions that require conversion to PDF.
 
-        Returns:
-            List of lowercase file extensions (including dot), e.g. docx
-        """
-        return ["docx", "doc", "odt", "ott", "xlsx", "xls", "ods", "csv" ,"pptx", "ppt", "odp","rtf"]
+    def _get_extensions_to_convert(self) -> list[str]:
+        """Return extensions that must be converted to PDF via LibreOffice before processing."""
+        return ["docx", "doc", "odt", "ott", "xlsx", "xls", "ods", "csv", "pptx", "ppt", "odp", "rtf"]
 
     ##########################################
     ############# CONVERTER ##################
     ##########################################
 
-    def convert(self, source_path:str) -> str:
-        """
-        Convert a document to PDF if needed, returning the path to the PDF.
+    def convert(self, source_path: str) -> str:
+        """Convert or copy the source file into the working directory.
 
-        If the file is already in a supported native format, returns the original path.
-        If conversion is needed and succeeds, returns the path to the temporary PDF.
-        If conversion fails, returns the original path as a fallback.
+        - Native formats are copied to a UUID-named file in the working directory.
+        - Convertible formats are converted to PDF via LibreOffice and the
+          resulting PDF is placed in the working directory.
+        - Unsupported extensions raise ``RuntimeError`` immediately.
 
         Args:
             source_path: Absolute path to the source document.
+
         Returns:
-            Path to a PDF file suitable for OCRHelper, or the original path if no conversion was needed or if conversion failed.
+            Absolute path to the working-directory copy (native format) or
+            the converted PDF.
+
+        Raises:
+            RuntimeError: If the converter is not booted, the file extension is
+                unsupported, the copy fails, or LibreOffice conversion fails.
         """
         #check if helper is booted
         if not self.is_booted():

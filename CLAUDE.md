@@ -331,6 +331,13 @@ dms_ai_bridge/
 │   └── models/
 │       └── config.py                    ← EnvConfig Pydantic model
 ├── services/
+│   ├── doc_ingestion/
+│   │   ├── IngestionService.py          ← orchestrator (boot Document → upload → PATCH)
+│   │   ├── doc_ingestion.py             ← entry point (python -m services.doc_ingestion)
+│   │   └── helper/
+│   │       ├── Document.py              ← central document class (convert, OCR, metadata, tags)
+│   │       ├── DocumentConverter.py     ← LibreOffice PDF conversion helper
+│   │       └── FileScanner.py           ← rglob + watchfiles file discovery
 │   ├── dms_rag_sync/
 │   │   ├── SyncService.py               ← DMS → embed → RAG orchestration
 │   │   └── dms_rag_sync.py              ← entry point (python -m services.dms_rag_sync)
@@ -358,7 +365,7 @@ dms_ai_bridge/
 
 ## Agent Responsibilities
 
-Seven specialised agents own distinct subsystems. Invoke the correct agent for any task
+Eight specialised agents own distinct subsystems. Invoke the correct agent for any task
 touching that subsystem. Agents that own interfaces must coordinate before changing
 public method signatures.
 
@@ -520,6 +527,81 @@ changing search/ranking logic in `SearchService`.
 
 ---
 
+### `ingestion-agent` — Document Ingestion Pipeline
+**Model:** `claude-sonnet-4-6`
+
+**Owns:**
+- `services/doc_ingestion/IngestionService.py` — orchestrator
+- `services/doc_ingestion/doc_ingestion.py` — entry point
+- `services/doc_ingestion/helper/Document.py` — central document class
+- `services/doc_ingestion/helper/DocumentConverter.py` — LibreOffice PDF conversion
+- `services/doc_ingestion/helper/FileScanner.py` — file discovery
+- Abstract write methods in `shared/clients/dms/DMSClientInterface.py`
+  (`do_upload_document`, `do_update_document`, `do_resolve_or_create_*`)
+- Paperless implementations of those write methods in `DMSClientPaperless.py`
+
+**Invoke when:**
+modifying the ingestion pipeline, changing OCR or text extraction strategy, updating
+path template parsing, debugging document upload or metadata update issues, or adding
+new DMS write capabilities.
+
+**Key classes:**
+
+`Document` (`services/doc_ingestion/helper/Document.py`):
+- Central class representing a file to be ingested
+- Lifecycle: `boot()` (converts file, extracts text, reads metadata & tags) / `cleanup()`
+- Path template parsing: `_read_meta_from_path()` — positional `{correspondent}`,
+  `{document_type}`, `{year}`, `{month}`, `{day}`, `{title}` segments; `correspondent`
+  is mandatory
+- OCR strategy: direct read for `txt`/`md`; PyMuPDF per-page text → Vision LLM fallback
+  for any page below `minimum_text_chars = 40`
+- LLM metadata: `_read_meta_from_content()` — JSON response with correspondent, document_type,
+  year, month, day, title; path metadata takes precedence (path wins over LLM)
+- LLM tags: `_read_tags_from_content()` — returns `list[str]`, max 3 tags
+- DMS cache context: `_get_dms_cache()` feeds existing document_types and tag names into
+  prompts so the LLM prefers existing values
+- Public getters: `get_title()`, `get_metadata() -> DocMetadata`, `get_tags() -> list[str]`,
+  `get_content() -> str`, `get_date_string(pattern) -> str | None`
+
+`DocMetadata` (dataclass in `Document.py`):
+```
+correspondent, document_type, year, month, day, title, filename
+```
+
+`DocumentConverter` (`services/doc_ingestion/helper/DocumentConverter.py`):
+- Wraps LibreOffice (`soffice`) to convert office formats to PDF
+- Native formats (pdf, png, jpg, jpeg, txt, md): copied to working directory unchanged
+- Convertible formats (docx, doc, odt, xlsx, xls, ods, csv, pptx, ppt, odp, rtf): run
+  LibreOffice headless, output moved to working directory
+- Lifecycle: `boot()` / `cleanup()` / `is_booted()`
+- Raises `RuntimeError` if LibreOffice is not in PATH
+
+`IngestionService` (`services/doc_ingestion/IngestionService.py`):
+- `do_ingest_file(file_path, root_path) -> int | None` — full pipeline:
+  1. `fill_cache()` on DMS client
+  2. Instantiate and `boot()` a `Document`
+  3. Call `get_metadata()`, `get_tags()`, `get_title()`, `get_content()`, `get_date_string()`
+  4. Resolve/create correspondent, document_type, tags via DMS write methods
+  5. Upload original file bytes via `do_upload_document()`
+  6. PATCH document with full metadata via `do_update_document()`
+  7. `cleanup()` the Document in a `finally` block
+
+**Key rules:**
+- `Document.boot()` raises on failure — wrap in try/except in `IngestionService`
+- `Document.cleanup()` MUST be called in a `finally` block — never skip
+- Path metadata takes precedence over LLM metadata (path wins)
+- `correspondent` is mandatory in path metadata — raise `RuntimeError` if absent
+- Vision LLM (`LLM_MODEL_VISION`) is required; raise `RuntimeError` at boot if not configured
+- `DocumentConverter` requires LibreOffice — raise `RuntimeError` if not found in PATH
+- Working directories use UUID-based names to avoid collisions across concurrent ingestions
+- Language for all LLM-extracted text is configured via `LANGUAGE` env var (default: `German`)
+
+**Coordination:**
+- `do_chat_vision()` on `LLMClientInterface` must be implemented by embed-llm-agent
+- DMS write methods must be implemented by dms-agent
+
+---
+
 ### `api-agent` — FastAPI Server (Phase III/IV)
 **Model:** `claude-opus-4-6`
 
@@ -665,6 +747,7 @@ All code, variable names, comments, docstrings, and log messages: **English**.
 | Redis, `CacheClientInterface`, filter option cache, cache invalidation | `cache-agent` |
 | Ollama, `LLMClientInterface`, embedding, chat, new LLM provider | `embed-llm-agent` |
 | Sync pipeline, `SyncService`, `SearchService`, orphan cleanup | `service-agent` |
+| File ingestion, `Document`, `DocumentConverter`, `IngestionService`, OCR | `ingestion-agent` |
 | FastAPI routes, `QueryRouter`, webhook, auth, Phase III/IV server | `api-agent` |
 | `UserMappingService`, `user_mapping.yml`, frontend/user_id resolution | `api-agent` |
 

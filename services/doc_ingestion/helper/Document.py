@@ -8,11 +8,29 @@ from shared.helper.HelperFile import HelperFile
 import fitz # PyMuPDF
 import base64
 import re
-import json 
+import json
 from dataclasses import dataclass
+
+class DocumentValidationError(Exception):
+    """Raised when a document cannot be ingested due to a known, expected condition.
+
+    Examples: missing correspondent in path, unsupported file format.
+    Callers should log this as WARNING, not ERROR.
+    """
+
 
 @dataclass
 class DocMetadata:
+    """Metadata extracted for a single document.
+
+    Fields are populated from two sources (path template takes precedence over LLM):
+    - Path template parsing: correspondent, document_type, year, month, day, title
+    - LLM extraction from document content: fills any fields left empty by path parsing
+
+    All fields are optional strings. Numeric fields (year, month, day) are stored as
+    strings to avoid lossy int conversion for values like "01".
+    """
+
     correspondent: str | None = None
     document_type: str | None = None
     year: str | None = None
@@ -22,15 +40,45 @@ class DocMetadata:
     filename: str | None = None
 
 class Document():
-    """Represents a document to be ingested, along with its metadata."""
-    def __init__(self, 
-                 root_path:str,
-                 source_file:str, 
-                 working_directory:str, 
-                 helper_config: HelperConfig, 
+    """Represents a single file to be ingested into the DMS.
+
+    Encapsulates the full per-document pipeline: format conversion, text extraction
+    (direct read or Vision LLM OCR), Markdown formatting, metadata extraction from
+    path template and LLM, and tag extraction via LLM.
+
+    Lifecycle:
+        1. Instantiate with source file path and dependencies.
+        2. Call ``await boot()`` — validates path metadata, converts the file,
+           extracts and formats text, reads metadata and tags.
+        3. Use getters (``get_content``, ``get_metadata``, ``get_tags``, etc.).
+        4. Call ``cleanup()`` in a ``finally`` block to remove temporary files.
+    """
+
+    def __init__(self,
+                 root_path: str,
+                 source_file: str,
+                 working_directory: str,
+                 helper_config: HelperConfig,
                  llm_client: LLMClientInterface,
                  dms_client: DMSClientInterface,
                  path_template: str | None = None) -> None:
+        """Initialise the document without performing any I/O.
+
+        Args:
+            root_path: Root scan directory; used to compute the path relative to
+                the template (e.g. ``/inbox``).
+            source_file: Absolute path to the source file to ingest.
+            working_directory: Base directory for temporary files.  A UUID-named
+                subdirectory is created inside it during ``boot()``.
+            helper_config: Shared configuration and logger provider.
+            llm_client: LLM client used for Vision OCR, content formatting,
+                metadata extraction, and tag extraction.
+            dms_client: DMS client whose cache is read to provide existing
+                document-type and tag names to LLM prompts.
+            path_template: Path template string with ``{correspondent}``,
+                ``{document_type}``, ``{year}``, ``{month}``, ``{day}``,
+                ``{title}`` placeholders.  Defaults to ``{filename}``.
+        """
         self._root_path = root_path
         self._path_template = path_template or self._get_default_path_template()
         self._source_file = source_file
@@ -44,14 +92,50 @@ class Document():
         self._converter: DocumentConverter | None = None  
         self._converted_file:str | None = None 
         self._extension:str | None = None
+        self._filename:str | None = None
         self._metadata:DocMetadata|None = None
         self._tags:list[str]|None = None
+
+        #settings
+        self._skip_direct_read = self._config.get_bool_val("DOC_INGESTION_SKIP_DIRECT_READ", False)
+        self._skip_ocr_read = self._config.get_bool_val("DOC_INGESTION_SKIP_OCR_READ", False)
+        self._minimum_text_chars_for_direct_read = self._config.get_number_val("DOC_INGESTION_MINIMUM_TEXT_CHARS_FOR_DIRECT_READ", 40)
 
     ##########################################
     ############### CORE #####################
     ##########################################
 
     async def boot(self) -> None:
+        """Prepare the document for data extraction.
+
+        Execution order:
+        1. Validate path template metadata (raises ``DocumentValidationError``
+           immediately if mandatory fields like ``correspondent`` are missing —
+           before any I/O or LLM call is made).
+        2. Create the UUID-named working directory.
+        3. Initialise ``DocumentConverter`` and convert the source file to a
+           supported format (native formats are copied; office formats are
+           converted to PDF via LibreOffice).
+        4. Extract raw text: direct read for ``txt``/``md``; PyMuPDF per-page
+           text with Vision LLM fallback for pages below the minimum-char
+           threshold for other formats.
+        5. Format the raw text as Markdown via the chat LLM.
+        6. Merge path-template metadata with LLM-extracted metadata.
+        7. Extract tags via the chat LLM.
+
+        If any step after directory creation raises, the working directory is
+        removed before re-raising so no temporary files are left behind.
+
+        Raises:
+            DocumentValidationError: Path template validation failed (e.g.
+                missing ``correspondent``).
+            RuntimeError: Any other unrecoverable error during boot.
+        """
+        # Validate path metadata first — pure string/regex, no I/O.
+        # Raises immediately if mandatory fields (e.g. correspondent) are missing,
+        # before any temp directories are created or LLM calls are made.
+        self._read_meta_from_path()
+
         #create directory
         if not self._helper_file.create_folder(self._working_directory):
             raise RuntimeError(f"Failed to create working directory for Document in '{self._working_directory}'")
@@ -72,10 +156,12 @@ class Document():
             #convert the file to supported format
             self._converted_file = self._converter.convert(self._source_file)
             self._extension = self._helper_file.get_file_extension(self._converted_file, True, True)
+            self._filename = self._helper_file.get_basename(self._source_file, True)
             self.logging.debug("Document now in supported format: '%s'", self._converted_file, color="green")
 
             #read the content and metadata of the file
-            self._content = await self._extract_text()  
+            raw_text = await self._extract_text()
+            self._content = await self._format_content(raw_text)
             self._metadata = await self._read_metadata()
             self._tags = await self._read_tags_from_content()
         except Exception as e:
@@ -84,17 +170,25 @@ class Document():
         
 
     def cleanup(self) -> None:
+        """Remove the working directory and reset all extracted state.
+
+        Must be called in a ``finally`` block after ``boot()`` to ensure
+        temporary files are deleted even when ingestion fails.
+        Safe to call even if ``boot()`` was never called or failed midway.
+        """
         #delete the working dir
         if not self._helper_file.remove_folder(self._working_directory):
             self.logging.warning(f"DocHelper: failed to delete working directory '{self._working_directory}' for converted files")
         #reset state
         self._converted_file = None
         self._extension = None
+        self._filename = None
         self._content = None
         self._metadata = None
         self._tags = None
 
     def is_booted(self) -> bool:
+        """Return True if the working directory exists and the converter is ready."""
         return self._helper_file.folder_exists(self._working_directory) and (self._converter is not None and self._converter.is_booted())
 
     ##########################################
@@ -106,18 +200,23 @@ class Document():
         return ["txt", "md"]
     
     def _get_default_path_template(self) -> str:
+        """Return the fallback path template used when none is configured."""
         return "{filename}"
     
     def get_title(self) -> str:
+        """Return the document title as '{correspondent} {document_type} {DD.MM.YYYY}'."""
         return f"{self._metadata.correspondent} {self._metadata.document_type} {self._metadata.day}.{self._metadata.month}.{self._metadata.year}"
 
     def get_metadata(self) -> DocMetadata:
+        """Return the fully merged metadata (path template + LLM fill-in)."""
         return self._metadata
-    
+
     def get_tags(self) -> list[str]:
+        """Return the LLM-extracted tag list, or an empty list if none were found."""
         return self._tags or []
-    
+
     def get_content(self) -> str:
+        """Return the Markdown-formatted document content."""
         return self._content
     
     def get_date_string(self, pattern:str = "%Y-%m-%d") -> str|None:
@@ -138,6 +237,18 @@ class Document():
     ##########################################
 
     async def _extract_text(self) -> str:
+        """Extract raw plain text from the converted file.
+
+        Dispatches to direct read for plain-text formats (``txt``, ``md``) or
+        to the smart extractor (PyMuPDF + Vision LLM) for all other formats.
+
+        Returns:
+            Raw extracted text string.
+
+        Raises:
+            RuntimeError: If the document is not booted, or if extraction yields
+                an empty result.
+        """
         if not self.is_booted():
             raise RuntimeError("DocHelper: cannot extract text, document not booted")
         # if we can read content directly, let's do it
@@ -145,6 +256,8 @@ class Document():
             text = self._extract_text_directly()
             if text is None or not text.strip():
                 raise RuntimeError(f"Error reading text directly from file '{self._converted_file}'")
+            self.logging.info(f"Extracted text directly from file '{self._filename}'", color="green")
+            self.logging.debug(text, color="blue")
             return text
         else:
             # otherwise we need to use Vision LLM OCR
@@ -158,8 +271,21 @@ class Document():
         return self._helper_file.read_text_file(self._converted_file)
     
     async def _extract_text_smart(self) -> str|None:
-        """Use Vision LLM to extract text from the file, without any pre-processing."""
-        minimum_text_chars = 40
+        """Extract text page-by-page using PyMuPDF with Vision LLM fallback.
+
+        For each page:
+        - If PyMuPDF can extract at least ``minimum_text_chars`` characters of
+          embedded text and ``DOC_INGESTION_SKIP_DIRECT_READ`` is False, that
+          text is used directly (fast, no API call).
+        - Otherwise the page is rendered as a PNG at ``page_dpi`` DPI and sent
+          to the Vision LLM for OCR (unless ``DOC_INGESTION_SKIP_OCR_READ`` is
+          True, in which case the page is silently skipped).
+
+        Returns:
+            All page texts joined by double newlines, or None on error.
+        """
+        # if ocr is disabled, we reduce the minimum text chars for direct read to a very low number for not loosing all text
+        minimum_text_chars = self._minimum_text_chars_for_direct_read if not self._skip_ocr_read else 10
         page_texts: list[str] = []
         page_dpi = 96
         try:
@@ -170,8 +296,14 @@ class Document():
                 direct_text = page.get_text().strip()
 
                 #make sure there is some text on the page
-                if len(direct_text) >= minimum_text_chars:
+                if not self._skip_direct_read and len(direct_text) >= minimum_text_chars:
                     page_texts.append(direct_text)
+                    self.logging.info(f"Extracted text page {page_num + 1} smart by reading directly from file '{self._filename}'", color="green")
+                    self.logging.debug(direct_text, color="blue")
+                    continue
+
+                #if ocr is disabled, skip pages without enough direct text
+                if self._skip_ocr_read:
                     continue
 
                 # Page has not enough text, fall back to Vision LLM OCR if possible
@@ -184,6 +316,8 @@ class Document():
                 page_text = await self._call_vision_llm(b64)
                 if page_text:
                     page_texts.append(page_text)
+                    self.logging.info(f"Extracted text page {page_num + 1} smart by using Vision LLM OCR for file '{self._filename}'", color="green")
+                    self.logging.debug(page_text, color="blue")
             doc.close()
         except Exception as exc:
             self.logging.error("Error extracting text from PDF '%s': %s", self._converted_file, exc)
@@ -216,12 +350,54 @@ class Document():
         except Exception as exc:
             self.logging.error("Vision LLM call failed for Document '%s': %s", self._converted_file, exc)
             return None
-        
+
+    async def _format_content(self, raw: str) -> str:
+        """Format raw extracted text as clean Markdown using the chat LLM.
+
+        Sends the raw text to the chat model with instructions to produce
+        Markdown with pipe tables, ``##`` headings, and ``**bold**`` for totals.
+        Any code fences the model wraps its output in are stripped.
+
+        Falls back to returning the unformatted ``raw`` text if the LLM call
+        fails, so ingestion can continue with plain-text content.
+
+        Args:
+            raw: Plain text as returned by ``_extract_text()``.
+
+        Returns:
+            Markdown-formatted content string, or ``raw`` on LLM failure.
+        """
+        prompt = (
+            "You are a document formatter. Format the following extracted document text as clean Markdown.\n\n"
+            "Rules:\n"
+            "- Preserve ALL text and values exactly — do not summarise or omit anything.\n"
+            "- Use ## for section headings.\n"
+            "- Use pipe tables for any tabular or structured key-value data.\n"
+            "- Use **bold** only for totals or key labels.\n"
+            "- Keep addresses, names, and flowing text as plain paragraphs.\n"
+            "- Output Markdown only — no explanations, no code fences.\n\n"
+            "Document text:\n"
+            + raw
+        )
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            result = await self._llm_client.do_chat(messages)
+            # Strip any code fences the model may wrap output in
+            result = re.sub(r"```[a-zA-Z]*\s*\n?(.*?)\n?```", r"\1", result.strip(), flags=re.DOTALL)
+            return result.strip() or raw
+        except Exception as exc:
+            self.logging.warning("Content formatting failed for '%s', using raw text: %s", self._source_file, exc)
+            return raw
+
     ##########################################
     ################# META ###################
     ##########################################
     async def _read_metadata(self) -> DocMetadata:
-        """Read metadata from the file path using the configured template."""
+        """Build the final ``DocMetadata`` by merging path and LLM sources.
+
+        Path template fields take precedence; the LLM fills any fields that
+        path parsing could not determine.
+        """
         #read from path primary
         path_meta = self._read_meta_from_path()        
         #fill up using llm
@@ -238,6 +414,21 @@ class Document():
         )
 
     def _read_meta_from_path(self) -> DocMetadata:
+        """Parse metadata from the file path using the configured path template.
+
+        Maps positional directory segments to template placeholders
+        (``{correspondent}``, ``{document_type}``, ``{year}``, ``{month}``,
+        ``{day}``, ``{title}``).  Each value is validated via
+        ``_validate_segment_from_path_meta`` before assignment; invalid values
+        (e.g. a non-numeric string for ``year``) are silently skipped.
+
+        Returns:
+            ``DocMetadata`` populated from the path.
+
+        Raises:
+            DocumentValidationError: If ``correspondent`` cannot be resolved
+                from the path (it is the only mandatory field).
+        """
         known_vars = frozenset({
             "correspondent", "document_type", "year", "month", "day", "title", "filename"
         })
@@ -262,7 +453,10 @@ class Document():
             if var in known_vars and self._validate_segment_from_path_meta(var, value):
                 setattr(path_meta, var, value)
         if not path_meta.correspondent:
-            raise RuntimeError(f"Document: correspondent is required in path metadata but not found for file '{self._source_file}' with template '{self._path_template}'")
+            raise DocumentValidationError(
+                "Document: correspondent is required in path metadata but not found for file '%s' with template '%s'"
+                % (self._source_file, self._path_template)
+            )
         return path_meta
     
     def _validate_segment_from_path_meta(self, var: str, value: str) -> bool:
@@ -277,7 +471,19 @@ class Document():
         return bool(value.strip())
     
     async def _read_meta_from_content(self) -> DocMetadata:
-        """Ask the LLM to extract metadata and parse the JSON response."""
+        """Extract metadata from the formatted document content via the chat LLM.
+
+        Sends the first 3 000 characters of the formatted content together with
+        an extraction prompt and an optional hint containing existing DMS
+        document-type names.  Parses the JSON response into a ``DocMetadata``.
+
+        Returns:
+            ``DocMetadata`` with fields populated from the LLM response.
+
+        Raises:
+            RuntimeError: If the LLM call fails or the response cannot be
+                parsed as JSON.
+        """
         #read the existing data from dms cache
         prompt = self._get_prompt_extraction() + (self._get_prompt_cache() or "") + "\nDocument text:\n" + self._content[:3000]
         messages = [{"role": "user", "content": prompt}]
@@ -303,6 +509,19 @@ class Document():
     ##########################################
 
     async def _read_tags_from_content(self) -> list[str]:
+        """Extract tags from the formatted document content via the chat LLM.
+
+        Sends the first 3 000 characters of the formatted content together with
+        a tagging prompt that includes existing DMS tag names as hints.  The
+        model returns a JSON array of at most 3 tag name strings.
+
+        Returns:
+            List of tag name strings (may be empty).
+
+        Raises:
+            RuntimeError: If the LLM call fails or the response is not a valid
+                JSON array.
+        """
         prompt = self._get_prompt_tags() + self._content[:3000]
         messages = [{"role": "user", "content": prompt}]
         try:
@@ -345,7 +564,7 @@ class Document():
     ##########################################
 
     def _get_prompt_extraction(self) -> str:
-        """Public method to expose the metadata extraction prompt for testing purposes."""
+        """Build the metadata extraction prompt for the chat LLM."""
         return ("""
             You are a document metadata extractor. Analyse the following document text and extract metadata.
 
@@ -364,7 +583,10 @@ class Document():
             """ % self._language).strip()
     
     def _get_prompt_cache(self) -> str|None:
-        """Public method to expose DMS cache for testing purposes."""
+        """Build an optional prompt segment listing existing DMS document types.
+
+        Returns None if the DMS cache is empty or contains no document types.
+        """
         cache = self._get_dms_cache()
         if not cache or not "document_types" in cache:
             return None
@@ -375,8 +597,8 @@ class Document():
             Only invent a new name if absolutely no existing value fits.
             """ % cache_line).strip()
     
-    def _get_prompt_tags(self) -> str|None:
-        """Public method to expose the tag extraction prompt for testing purposes."""        
+    def _get_prompt_tags(self) -> str:
+        """Build the tag extraction prompt, including existing DMS tag names as hints."""
         cache = self._get_dms_cache()        
         tag_names = cache.get("tags", [])
         tag_context = ", ".join(tag_names) if tag_names else "(none)"

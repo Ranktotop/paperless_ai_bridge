@@ -1,11 +1,13 @@
 """Core orchestrator for the document ingestion pipeline."""
+import hashlib
 import os
 
+from shared.clients.cache.CacheClientInterface import CacheClientInterface, KEY_INGESTION_FILE
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.models.DocumentUpdate import DocumentUpdateRequest
 from shared.clients.llm.LLMClientInterface import LLMClientInterface
 from shared.helper.HelperConfig import HelperConfig
-from services.doc_ingestion.helper.Document import Document
+from services.doc_ingestion.helper.Document import Document, DocumentValidationError
 from shared.helper.HelperFile import HelperFile
 
 
@@ -19,6 +21,7 @@ class IngestionService:
         helper_config: HelperConfig,
         dms_client: DMSClientInterface,
         llm_client: LLMClientInterface,
+        cache_client: CacheClientInterface,
         template: str | None = None,
         default_owner_id: int | None = None
     ) -> None:
@@ -26,6 +29,7 @@ class IngestionService:
         self.logging = helper_config.get_logger()
         self._llm_client = llm_client
         self._dms_client = dms_client
+        self._cache_client = cache_client
         self._template = template
         self._default_owner_id = default_owner_id
         self._helper_file = HelperFile()
@@ -55,6 +59,17 @@ class IngestionService:
         Returns:
             DMS document ID on success, None on failure.
         """
+
+        # Check file hash cache — skip immediately if already ingested
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        cache_key = "%s:%s" % (KEY_INGESTION_FILE, file_hash)
+        cached_doc_id = await self._cache_client.do_get(cache_key)
+        if cached_doc_id is not None:
+            self.logging.info("Skipping '%s': already ingested (doc_id=%s).", file_path, cached_doc_id, color="blue")
+            return int(cached_doc_id)
+        
         self.logging.info("Ingesting file '%s'...", file_path)
 
         #load dms cache first
@@ -73,6 +88,9 @@ class IngestionService:
         # Boot up the document (fetches text of the file)
         try:
             await theDocument.boot()
+        except DocumentValidationError as e:
+            self.logging.warning("Skipping '%s': %s", file_path, e, color="yellow")
+            return None
         except Exception as e:
             self.logging.error("Failed to boot document '%s': %s", file_path, e)
             return None
@@ -110,16 +128,11 @@ class IngestionService:
                 except Exception as exc:
                     self.logging.warning("Failed to resolve tag '%s': %s", tag_name, exc)
 
-            # Upload original file to dms
+            # Upload original file to dms (file_bytes already read above for hash check)
             try:
-                with open(file_path, "rb") as f:
-                    file_bytes = f.read()
-
-                file_name = os.path.basename(file_path)
-
                 doc_id = await self._dms_client.do_upload_document(
                     file_bytes=file_bytes,
-                    file_name=file_name,
+                    file_name=os.path.basename(file_path),
                     owner_id=self._default_owner_id,
                 )
             except FileExistsError:
@@ -128,6 +141,9 @@ class IngestionService:
             except Exception as exc:
                 self.logging.error("Upload failed for '%s': %s", file_path, exc)
                 return None
+
+            # Store hash after confirmed upload so the file is skipped on future runs
+            await self._cache_client.do_set(cache_key, str(doc_id))
 
             # Upsert the DMS Document with the extracted metadata
             try:

@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from shared.logging.logging_setup import setup_logging
 from shared.helper.HelperConfig import HelperConfig
+from shared.clients.cache.CacheClientManager import CacheClientManager
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.DMSClientManager import DMSClientManager
 from shared.clients.llm.LLMClientManager import LLMClientManager
@@ -87,15 +88,16 @@ def _read_engine_tasks(dms_clients: list[DMSClientInterface]) -> list[_EngineTas
     return tasks
 
 
-async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client) -> None:
+async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client) -> None:
     """Scan each engine's directory once and ingest all found files."""
     for task in tasks:
         service = IngestionService(
             helper_config=helper_config,
             dms_client=task.dms_client,
             llm_client=llm_client,
+            cache_client=cache_client,
             template=task.template,
-            default_owner_id=task.owner_id
+            default_owner_id=task.owner_id,
         )
         scanner = FileScanner(root_path=task.path)
         files = scanner.scan_once()
@@ -107,16 +109,16 @@ async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_c
             await service.do_ingest_file(file_path=file_path, root_path=task.path)
 
 
-async def _run_watch(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, language: str) -> None:
+async def _run_watch(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client) -> None:
     """Watch each engine's directory concurrently and ingest on changes."""
     async def watch_engine(task: _EngineTask) -> None:
         service = IngestionService(
             helper_config=helper_config,
             dms_client=task.dms_client,
             llm_client=llm_client,
+            cache_client=cache_client,
             template=task.template,
             default_owner_id=task.owner_id,
-            language=language,
         )
         scanner = FileScanner(root_path=task.path)
         logging.info(
@@ -137,8 +139,9 @@ async def run() -> None:
 
     dms_clients = DMSClientManager(helper_config=helper_config).get_clients()
     llm_client = LLMClientManager(helper_config=helper_config).get_client()
+    cache_client = CacheClientManager(helper_config=helper_config).get_client()
 
-    for client in [*dms_clients, llm_client]:
+    for client in [*dms_clients, llm_client, cache_client]:
         await client.boot()
 
     tasks = _read_engine_tasks(dms_clients)
@@ -153,11 +156,11 @@ async def run() -> None:
         await task.dms_client.fill_cache()
 
     if watch:
-        await _run_watch(tasks, helper_config, llm_client)
+        await _run_watch(tasks, helper_config, llm_client, cache_client)
     else:
-        await _run_once(tasks, helper_config, llm_client)
+        await _run_once(tasks, helper_config, llm_client, cache_client)
 
-    for client in [*dms_clients, llm_client]:
+    for client in [*dms_clients, llm_client, cache_client]:
         await client.close()
 
 
