@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(git fetch:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git rm:*)",
+      "Bash(grep:*)",
+      "Bash(gh api:*)",
+      "Bash(do:*)",
+      "Bash(PYTHONPATH=/home/marcmeese/dms_ai_bridge ROOT_DIR=/home/marcmeese/dms_ai_bridge APP_VERSION=dev .venv/bin/python:*)",
+      "Bash(PYTHONPATH=/home/marcmeese/dms_ai_bridge .venv/bin/python:*)",
+      "mcp__ide__getDiagnostics",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(/home/marcmeese/dms_ai_bridge/.venv/bin/pip install:*)",
+      "Bash(/usr/bin/python3:*)"
+    ]
+  }
+}

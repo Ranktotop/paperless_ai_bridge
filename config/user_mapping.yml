@@ -1,0 +1,21 @@
+# User identity mapping: AI frontend user IDs → DMS owner IDs
+#
+# Structure:
+#   users:
+#     "<frontend>":       # AI system identifier — must match the {frontend} path param
+#       "<user_id>":      # Frontend user ID (always a string)
+#         <engine>: <id>  # DMS engine name: DMS owner_id (int)
+#
+# The frontend identifier must match the {frontend} path parameter in
+# POST /query/{frontend}.  The engine name must match the engine registered
+# via DMS_ENGINES in the environment.
+#
+# Missing mapping → HTTP 403 Forbidden (never falls back to a default owner).
+
+users:
+  "openwebui":
+    "1":
+      paperless: 4
+  "anythingllm":
+    "1":
+      paperless: 4

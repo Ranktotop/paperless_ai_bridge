@@ -32,7 +32,7 @@ Qdrant (vector store, owner_id-filtered)
   │
 FastAPI (POST /query)           ← Phase III
   │── LLMClientInterface.do_embed()
-  │── RAGClientInterface.do_scroll()
+  │── RAGClientInterface.do_search_points()
   └── LLMClientInterface.do_chat()    ← Phase IV
 ```
 
@@ -68,7 +68,7 @@ up automatically via reflection.
   - `DocumentHighDetails` — canonical output model with resolved correspondent, tags, type, owner
 - `RAGClientInterface` (ABC) + `RAGClientQdrant` — Qdrant REST client via httpx
   - Deterministic point IDs (`uuid5(engine:doc_id:chunk_index)`)
-  - `do_upsert_points()`, `do_scroll()`, `do_delete_points_by_filter()`, `do_create_collection()`
+  - `do_upsert_points()`, `do_fetch_points()`, `do_search_points()`, `do_count()`, `do_delete_points_by_filter()`, `do_create_collection()`
 - `SyncService` — full sync (all documents) + incremental sync (single document)
   - Text chunking: character-level, `CHUNK_SIZE=1000`, `CHUNK_OVERLAP=100`
   - `asyncio.Semaphore(DOC_CONCURRENCY=5)` — bounded concurrency
@@ -92,7 +92,7 @@ up automatically via reflection.
 ### Phase III — FastAPI Server (pending)
 
 - `POST /webhook/document` — fire-and-forget incremental sync via `BackgroundTasks`
-- `POST /query` — embed query → `do_scroll()` with `owner_id` filter → `SearchResponse`
+- `POST /query` — embed query → `do_search_points()` with `owner_id` filter → `SearchResponse`
 - `X-API-Key` authentication on all endpoints
 
 ### Phase IV — Agentic Logic (pending)
@@ -128,7 +128,7 @@ dms_ai_bridge/
 │   │   └── rag/
 │   │       ├── RAGClientInterface.py    # RAG ABC
 │   │       ├── RAGClientManager.py      # Factory (reflection-based)
-│   │       ├── models/                  # VectorPoint, Scroll
+│   │       ├── models/                  # Point.py (request + response models)
 │   │       └── qdrant/
 │   │           └── RAGClientQdrant.py
 │   ├── helper/
@@ -258,7 +258,7 @@ curl http://localhost:6333/collections/<RAG_QDRANT_COLLECTION>
 # Inspect the first few points
 curl -X POST http://localhost:6333/collections/<RAG_QDRANT_COLLECTION>/points/scroll \
   -H "Content-Type: application/json" \
-  -d '{"limit": 3, "with_payload": true, "with_vector": false}'
+  -d '{"limit": 3, "include_fields": true, "with_vector": false}'
 ```
 
 Each point's payload contains `dms_doc_id`, `owner_id`, `title`, `chunk_text`, and the

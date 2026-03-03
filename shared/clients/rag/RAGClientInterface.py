@@ -1,9 +1,7 @@
 from abc import abstractmethod
-from typing import Any
-import math
 
 import httpx
-from shared.clients.rag.models.Scroll import ScrollResult
+from shared.clients.rag.models.Point import PointUpsert, PointHighDetails, PointsListResponse
 from shared.clients.ClientInterface import ClientInterface
 import json
 
@@ -13,10 +11,6 @@ from shared.helper.HelperConfig import HelperConfig
 class RAGClientInterface(ClientInterface):
     def __init__(self, helper_config: HelperConfig):
         super().__init__(helper_config=helper_config)
-
-    ##########################################
-    ############### CHECKER ##################
-    ##########################################
 
     ##########################################
     ################ GETTER ##################
@@ -108,17 +102,69 @@ class RAGClientInterface(ClientInterface):
         pass
 
     @abstractmethod
-    def get_scroll_payload(self, filters: list[dict], with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None, offset: str | None = None) -> dict:
+    def _get_endpoint_search(self) -> str:
+        """Returns the endpoint path for vector similarity search requests.
+
+        Returns:
+            str: The endpoint path (e.g. "/collections/my_col/points/search")
+
+        Raises:
+            NotImplementedError: If the method is not implemented in a subclass.
+        """
+        pass
+
+    ##########################################
+    ############### PAYLOADS #################
+    ##########################################
+
+    def get_scroll_payload(self, filters: list[dict], include_fields: bool | list | dict, with_vector: bool | list, limit: int | None = None, next_page_id: str | None = None)->dict:
         """
         Returns the payload template for scroll requests to the RAG backend.
 
         Args:
             filters (list[dict]): The filters to apply to the scroll request.
-            with_payload (bool | list | dict): Whether to include the payload in the scroll request, or which payload fields to include.
+            include_fields (bool | list | dict): Which fields to include in the scroll request.
             with_vector (bool | list): Whether to include the vector in the scroll request, or which vector fields to include.
             limit (int | None): The maximum number of results to return.
-            offset (str | None): Pagination cursor returned by the previous scroll page.
-                                 None means start from the beginning.
+            next_page_id (str | None): Pagination cursor returned by the previous scroll page.
+                                        None means start from the beginning.
+
+        Returns:
+            dict: The payload for the scroll request.
+
+        Raises:
+            NotImplementedError: If the method is not implemented in a subclass.
+        """
+        # make sure some fields are always included for correct parsing of points
+        required_fields = ["dms_doc_id", "dms_engine", "content_hash"]
+        if isinstance(include_fields, list):
+            #copy list to avoid modifying original
+            include_fields = include_fields.copy()
+            for field in required_fields:
+                if field not in include_fields:
+                    include_fields.append(field)
+        elif isinstance(include_fields, dict) and not include_fields.get("include_all", False):
+            # copy dict to avoid modifying original
+            include_fields = include_fields.copy()
+            raise NotImplementedError("include_fields as dict with field-level control is not implemented yet. Please use a list of fields or set include_all to True.")
+        else:
+            # if include_fields is bool there are already all fields included
+            pass
+        return self._get_scroll_payload(filters, include_fields, with_vector, limit, next_page_id)
+
+
+    @abstractmethod
+    def _get_scroll_payload(self, filters: list[dict], include_fields: bool | list | dict, with_vector: bool | list, limit: int | None = None, next_page_id: str | None = None) -> dict:
+        """
+        Returns the payload template for scroll requests to the RAG backend.
+
+        Args:
+            filters (list[dict]): The filters to apply to the scroll request.
+            include_fields (bool | list | dict): Which fields to include in the scroll request.
+            with_vector (bool | list): Whether to include the vector in the scroll request, or which vector fields to include.
+            limit (int | None): The maximum number of results to return.
+            next_page_id (str | None): Pagination cursor returned by the previous scroll page.
+                                        None means start from the beginning.
 
         Returns:
             dict: The payload for the scroll request.
@@ -128,19 +174,62 @@ class RAGClientInterface(ClientInterface):
         """
         pass
 
-    @abstractmethod
-    def extract_next_page_offset(self, raw_response: dict) -> str | None:
-        """
-        Extracts the pagination cursor for the next scroll page from a raw response.
-
-        Analogous to the nextPage field in DMSClientInterface list responses.
-        Return None when the backend signals that no further pages exist.
+    def get_search_payload(
+        self,
+        filters: dict,
+        include_fields: bool | list | dict,
+        with_vector: bool,
+        vector: list[float]
+    ) -> dict:
+        """Builds the backend-specific request payload for a vector similarity search.
 
         Args:
-            raw_response (dict): The raw JSON response from the scroll endpoint.
+            filters: Full filter object e.g. {"must": [...]}.
+            include_fields: Whether to include the payload in results.
+            with_vector: Whether to include the stored vector in results.
+            vector: Query embedding vector.
 
         Returns:
-            str | None: The cursor for the next page, or None if this was the last page.
+            dict: The payload for the search request.
+
+        Raises:
+            NotImplementedError: If the method is not implemented in a subclass.
+        """
+        # make sure some fields are always included for correct parsing of points
+        required_fields = ["dms_doc_id", "dms_engine", "content_hash"]
+        if isinstance(include_fields, list):
+            #copy list to avoid modifying original
+            include_fields = include_fields.copy()
+            for field in required_fields:
+                if field not in include_fields:
+                    include_fields.append(field)
+        elif isinstance(include_fields, dict) and not include_fields.get("include_all", False):
+            # copy dict to avoid modifying original
+            include_fields = include_fields.copy()
+            raise NotImplementedError("include_fields as dict with field-level control is not implemented yet. Please use a list of fields or set include_all to True.")
+        else:
+            # if include_fields is bool there are already all fields included
+            pass
+        return self._get_search_payload(filters=filters, include_fields=include_fields, with_vector=with_vector, vector=vector)
+
+    @abstractmethod
+    def _get_search_payload(
+        self,
+        filters: dict,
+        include_fields: bool | list | dict,
+        with_vector: bool,
+        vector: list[float]
+    ) -> dict:
+        """Builds the backend-specific request payload for a vector similarity search.
+
+        Args:
+            filters: Full filter object e.g. {"must": [...]}.
+            include_fields: Whether to include the payload in results.
+            with_vector: Whether to include the stored vector in results.
+            vector: Query embedding vector.
+
+        Returns:
+            dict: The payload for the search request.
 
         Raises:
             NotImplementedError: If the method is not implemented in a subclass.
@@ -176,18 +265,17 @@ class RAGClientInterface(ClientInterface):
         Raises:
             NotImplementedError: If the method is not implemented in a subclass.
         """
-        pass
+        pass 
 
     @abstractmethod
-    def extract_scroll_content(self, raw_response: dict) -> dict:
-        """
-        Extracts the relevant content from a raw scroll response.
+    def get_upsert_payload(self, points: list[PointUpsert]) -> dict:
+        """Build the backend-specific JSON body for a batch upsert.
 
         Args:
-            raw_response (dict): The raw JSON response from the scroll endpoint.
+            points (list[PointUpsert]): Typed points to upsert.
 
         Returns:
-            dict: A dict with keys "result", "status", "time".
+            dict: The request body for the upsert endpoint.
 
         Raises:
             NotImplementedError: If the method is not implemented in a subclass.
@@ -225,71 +313,42 @@ class RAGClientInterface(ClientInterface):
                     "distance": distance}},
             endpoint=self._get_endpoint_create_collection())
 
-    async def do_upsert_points(self, points: list[dict[str, Any]]) -> httpx.Response:
+    async def do_upsert_points(self, points: list[PointUpsert]) -> bool:
         """Upsert points into the rag backend collection.
         Inserts new points or replaces existing ones if a point with the same ID already exists.
 
         Args:
-            points (list[dict[str, Any]]): The list of points to upsert.
+            points (list[PointUpsert]): The typed list of points to upsert.
 
         Returns:
-            httpx.Response: The response from the upsert request.
+            bool: True if the upsert was successful, False otherwise.
         """
-        return await self.do_request(
+        resp = await self.do_request(
             method="PUT",
-            content=json.dumps({"points": points}),
+            content=json.dumps(self.get_upsert_payload(points)),
             endpoint=self._get_endpoint_points(),
             additional_headers={"Content-Type": "application/json"})
+        return self._parse_endpoint_points_upsert(resp.json())
 
-    async def do_delete_points_by_filter(self, filter: dict) -> None:
+    async def do_delete_points_by_filter(self, filter: dict) -> bool:
         """Deletes all points matching the given filter from the RAG backend.
         Used when a DMS document is updated (delete old chunks) or deleted entirely.
 
         Args:
             filter (dict): The filter that identifies which points to delete.
                            Must always include owner_id to enforce access isolation.
+
+        Returns:
+            bool: True if the delete was successful, False otherwise.
         """
-        await self.do_request(
+        resp = await self.do_request(
             method="POST",
             content=json.dumps(self.get_delete_payload(filter)),
             endpoint=self._get_endpoint_delete_points(),
             additional_headers={"Content-Type": "application/json"},
             raise_on_error=True,
-        )
-
-    async def do_scroll(self, filters: dict, with_payload: bool | list | dict, with_vector: bool | list, limit: int | None = None, offset: str | None = None) -> ScrollResult:
-        """Scroll a single page from a collection in the RAG backend.
-
-        To retrieve all matching points across an arbitrary number of pages use
-        do_scroll_all() instead.
-
-        Args:
-            filters (dict): The filters to apply to the scroll request.
-            with_payload (bool | list | dict): Whether to include the payload in the scroll request, or which payload fields to include.
-            with_vector (bool | list): Whether to include the vector in the scroll request.
-            limit (int | None): The maximum number of results to return per page.
-            offset (str | None): Pagination cursor from the previous page's next_page_offset.
-                                 None starts from the beginning of the collection.
-
-        Returns:
-            ScrollResult: The result from the scroll request, including next_page_offset
-                          when further pages are available.
-        """
-        resp = await self.do_request(
-            method="POST",
-            content=json.dumps(self.get_scroll_payload(filters, with_payload, with_vector, limit, offset)),
-            endpoint=self._get_endpoint_scroll(),
-            additional_headers={"Content-Type": "application/json"},
-            raise_on_error=True,
-        )
-        raw_response = resp.json()
-        scroll_content = self.extract_scroll_content(raw_response=raw_response)
-        return ScrollResult(
-            result=scroll_content.get("result", []),
-            status=scroll_content.get("status", "ok"),
-            time=scroll_content.get("time", 0),
-            next_page_offset=self.extract_next_page_offset(raw_response),
-        )
+        )    
+        return self._parse_endpoint_points_delete(resp.json())
 
     async def do_count(self, filters: list[dict]) -> int:
         """Count the total number of points matching the given filters.
@@ -307,44 +366,145 @@ class RAGClientInterface(ClientInterface):
             additional_headers={"Content-Type": "application/json"},
             raise_on_error=True,
         )
-        return resp.json().get("result", {}).get("count", 0)
+        return self._parse_endpoint_points_count(resp.json())
+    
+    async def do_search_points(
+        self,
+        vector: list[float],
+        filters: dict,
+        include_fields: bool | list | dict = True,
+        with_vector: bool = False,
+    ) -> list[PointHighDetails]:
+        """Search for points by vector similarity + optional filters.
 
-    async def do_scroll_all(self, filters: dict, with_payload: bool | list | dict, with_vector: bool | list) -> ScrollResult:
-        """Scroll through ALL points matching the filter, paginating automatically.
+        Uses the backend's native ANN search endpoint (e.g. Qdrant /points/search).
+        Results are ranked by similarity score descending.
+
+        Args:
+            vector: Query embedding vector.
+            filters: Full filter object e.g. {"must": [...]}.
+            include_fields: Whether to include the payload in results.
+            with_vector: Whether to include the stored vector in results.
+
+        Returns:
+            list[PointHighDetails]: List of points ranked by score.
+        """
+        resp = await self.do_request(
+                method="POST",
+                content=json.dumps(self.get_search_payload(filters=filters, include_fields=include_fields, with_vector=with_vector, vector=vector)),
+                endpoint=self._get_endpoint_search(),
+                additional_headers={"Content-Type": "application/json"},
+                raise_on_error=True,
+            )
+        points_search_response = self._parse_endpoint_points_search(resp.json())
+        #remove all points without content
+        filtered_points = [p for p in points_search_response if p.chunk_text.strip()]
+        return filtered_points
+
+    async def do_fetch_points(self, filters: dict, include_fields: bool | list | dict, with_vector: bool | list) -> list[PointHighDetails]:
+        """Fetch ALL points matching the filter, paginating automatically.
 
         Analogous to do_fetch_documents() in DMSClientInterface — runs a loop
         driven by next_page_offset until the backend signals there are no more pages.
 
         Args:
             filters (dict): The filters to apply to the scroll request.
-            with_payload (bool | list | dict): Whether to include the payload, or which fields.
+            include_fields (bool | list | dict): Which fields to include in the results.
             with_vector (bool | list): Whether to include the vector in each result point.
 
         Returns:
-            ScrollResult: All matching points collected across all pages.
-                          next_page_offset is always None on the returned result.
+            list[PointHighDetails]: All matching points collected across all pages.
         """
-        page_size = 1000
-        all_points: list[dict] = []
-        offset: str | None = None
+        points = []
         page = 1
+        page_size = 1000
         total_points = await self.do_count(filters)
-        total_pages = math.ceil(total_points / page_size) if total_points > 0 else 1
+
+        next_page_id: str | None = None
+        
         while True:
-            page_result = await self.do_scroll(
-                filters=filters,
-                with_payload=with_payload,
-                with_vector=with_vector,
-                limit=page_size,
-                offset=offset,
+            resp = await self.do_request(
+                method="POST",
+                content=json.dumps(self.get_scroll_payload(filters, include_fields, with_vector, page_size, next_page_id)),
+                endpoint=self._get_endpoint_scroll(),
+                additional_headers={"Content-Type": "application/json"},
+                raise_on_error=True,
             )
-            all_points.extend(page_result.result)
-            self.logging.info(
-                "Fetched RAG points page %d of %d from %s, total points so far: %d of %d",
-                page, total_pages, self.get_engine_name(),len(all_points), total_points,
-            )
-            offset = page_result.next_page_offset
-            if not offset:
-                break
-            page += 1
-        return ScrollResult(result=all_points, status="ok", time=0)
+            points_list_response = self._parse_endpoint_points(resp.json(), requested_page_size=page_size, total_points=total_points, current_page=page)
+            points.extend(points_list_response.points)
+            self.logging.debug("Fetched points page %d of %d from %s, total points so far: %d of %d", page, points_list_response.lastPage, self._get_engine_name(), len(points), points_list_response.overallCount)
+            next_page_id = points_list_response.nextPageId
+            page = points_list_response.nextPage
+            if not next_page_id:
+                break            
+        return points
+    
+    ##########################################
+    ########### RESPONSE PARSER ##############
+    ##########################################
+
+    ############### LIST RESPONSES ###############
+    @abstractmethod
+    def _parse_endpoint_points(self, response: dict, requested_page_size:int, total_points:int, current_page:int) -> PointsListResponse:
+        """
+        Parses the response from the point listing endpoint and returns a list of points with their metadata.
+
+        Args:
+            response (dict): The raw response from the point listing endpoint.
+            requested_page_size (int): The page size that was requested for this point listing. This is used to calculate the last page number in the pagination info.
+            total_points (int): The total number of points in the collection.
+            current_page (int): The current page number being requested.
+        Returns:
+            PointsListResponse: The parsed response containing a list of points and pagination information.
+        """
+        pass
+
+    ############### GET RESPONSES ###############
+    @abstractmethod
+    def _parse_endpoint_points_search(self, response: dict) -> list[PointHighDetails]:
+        """
+        Parses the response from the point search endpoint and returns a list of points with their metadata.
+
+        Args:
+            response (dict): The raw response from the point search endpoint.
+        Returns:
+            list[PointHighDetails]: The parsed response containing a list of points with their metadata.
+        """
+
+    @abstractmethod
+    def _parse_endpoint_points_count(self, response: dict) -> int:
+        """
+        Parses the response from the point count endpoint and returns the total number of matching points.
+
+        Args:
+            response (dict): The raw response from the point count endpoint.
+        Returns:            
+            int: The total number of matching points.
+        """
+        pass
+
+    ############### UPDATE RESPONSES ###############
+    @abstractmethod
+    def _parse_endpoint_points_upsert(self, response: dict) -> bool:
+        """
+        Parses the response from the point upsert endpoint and returns whether the upsert was successful.
+
+        Args:
+            response (dict): The raw response from the point upsert endpoint.
+        Returns:
+            bool: True if the upsert was successful, False otherwise.
+        """
+        pass
+
+    ############### DELETE RESPONSES ###############
+    @abstractmethod
+    def _parse_endpoint_points_delete(self, response: dict) -> bool:
+        """
+        Parses the response from the point delete endpoint and returns whether the delete was successful.
+
+        Args:
+            response (dict): The raw response from the point delete endpoint.
+        Returns:
+            bool: True if the delete was successful, False otherwise.
+        """
+        pass

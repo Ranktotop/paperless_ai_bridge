@@ -45,7 +45,7 @@ the Paperless backend.
 **Read-only reference:**
 - `shared/clients/ClientInterface.py` — base class, do not modify
 - `shared/helper/HelperConfig.py` — config reader, do not modify
-- `shared/clients/rag/models/VectorPoint.py` — understand field mapping from DocumentHighDetails
+- `shared/clients/rag/models/Point.py` — understand field mapping from DocumentHighDetails to PointHighDetailsRequest
 
 ## Interfaces and Classes in Scope
 
@@ -104,6 +104,6 @@ Follow all conventions in CLAUDE.md. Additional rules for this agent:
 
 **Coordination points:**
 - If you add fields to `DocumentHighDetails`, notify sync-agent — SyncService must map new
-  fields to VectorPoint; coordinate with rag-agent on whether VectorPoint needs updating
+  fields to `PointHighDetailsRequest`; coordinate with rag-agent on whether `Point.py` needs updating
 - If you change `fill_cache()` return behavior (e.g. raise instead of warn on partial cache),
   notify sync-agent as SyncService calls this method directly

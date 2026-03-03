@@ -32,10 +32,20 @@ RAGClientInterface.do_upsert_points()   Ollama /api/embed
 Qdrant (vector store, owner_id-filtered)
   ▲
   │
-FastAPI (POST /query)
+FastAPI (POST /query/{frontend})
+  │── UserMappingService.resolve(frontend, user_id, engine) → owner_id
   │── LLMClientInterface.do_embed()    ← embed query text
-  │── RAGClientInterface.do_scroll()   ← filter by owner_id + vector
+  │── RAGClientInterface.do_search_points()   ← filter by owner_id + vector
   └── LLMClientInterface.do_chat()     ← Phase IV synthesis
+
+OpenWebUI / AnythingLLM
+  └── POST /query/{frontend}  {"user_id": "5", "query": "..."}
+         │  frontend = path param ("openwebui" | "anythingllm" | …)
+         ▼
+  UserMappingService reads config/user_mapping.yml
+         │  resolve("openwebui", "5", "paperless") → owner_id=3
+         ▼
+  SearchService.do_search(query, owner_id=3, …)
 ```
 
 Additional DMS backends, RAG backends, and LLM providers can be added without touching
@@ -50,14 +60,80 @@ picks them up automatically.
 |---|---|---|
 | I | Shared infrastructure, DMS client, RAG client, SyncService | Complete |
 | II | LLM client (embedding via Ollama) | Complete |
-| III | FastAPI server — POST /webhook/document + POST /query (scroll-based) | Pending |
+| III | FastAPI server — POST /webhook/{engine}/document + POST /query (scroll-based) | Pending |
 | IV | LangChain ReAct agent, vector similarity search, LLM synthesis | Pending |
+
+---
+
+## User Identity & Mapping
+
+The bridge serves multiple AI frontends (OpenWebUI, AnythingLLM, …). Each frontend has its
+own user namespace. DMS backends (Paperless-ngx, …) have their own owner concept. These two
+namespaces are independent and must be explicitly bridged.
+
+### Identity layers
+
+| Layer | ID type | Example |
+|---|---|---|
+| AI frontend | `user_id: str` | `"5"` (OpenWebUI user) |
+| DMS backend | `owner_id: int` | `3` (Paperless owner) |
+
+The `user_id` is sent by the frontend in the request body. The `owner_id` is resolved
+server-side via `UserMappingService` before any DMS or RAG call is made. Clients never
+send or receive `owner_id` — it is an internal implementation detail.
+
+### Mapping configuration (`config/user_mapping.yml`)
+
+```yaml
+users:
+  "openwebui":
+    "5":               # OpenWebUI user_id (string)
+      paperless: 3     # Paperless-ngx owner_id (int)
+    "7":
+      paperless: 8
+  "anythingllm":
+    "12":
+      paperless: 3     # same DMS owner as OpenWebUI user "5"
+```
+
+File path is configured via `USER_MAPPING_FILE` env var (default: `config/user_mapping.yml`).
+The file is loaded once at startup and held in `app.state`. A restart is required to pick
+up changes.
+
+### UserMappingService (`server/user_mapping/UserMappingService.py`)
+
+Key methods:
+- `resolve(frontend: str, user_id: str, engine: str) -> int | None` — returns DMS owner_id
+- `reverse_resolve(owner_id: int, engine: str) -> list[tuple[str, str]]` — returns all
+  `(frontend, user_id)` pairs that map to this owner (used by webhook for cache invalidation)
+
+If `resolve()` returns `None` (no mapping found), the QueryRouter raises HTTP 403 — unmapped
+users cannot search.
+
+### Route design
+
+```
+POST /query/{frontend}
+  path param: frontend  — identifies the calling AI system ("openwebui", "anythingllm", …)
+  body:       user_id   — the user's ID within that frontend
+              query     — natural language query
+              limit     — max results (default 5)
+              chat_history — optional prior turns
+```
+
+The `{frontend}` path parameter is declared in `QueryRouter` and passed to
+`UserMappingService.resolve()` before `SearchService` is called.
+
+### Security note
+
+`owner_id` MUST be resolved from the mapping before any RAG or DMS operation. A missing
+or unresolvable mapping is a hard 403 — never fall back to a default owner.
 
 ---
 
 ## Generic Interfaces
 
-All HTTP clients inherit from `ClientInterface`. The three domain interfaces extend it.
+All HTTP clients inherit from `ClientInterface`. The four domain interfaces extend it.
 
 ### `ClientInterface` (`shared/clients/ClientInterface.py`)
 
@@ -102,22 +178,39 @@ Factory: `DMSClientManager` — reads `DMS_ENGINES` from env
 ABC for all vector database backends.
 
 Key methods:
-- `do_upsert_points(points: list[dict])` — insert/replace with deterministic UUIDs
-- `do_scroll(filters, limit, with_payload, with_vector) -> ScrollResult`
-- `do_delete_points_by_filter(filters)`
+- `do_upsert_points(points: list[PointUpsert]) -> bool` — insert/replace with deterministic UUIDs
+- `do_fetch_points(filters, include_fields, with_vector) -> list[PointHighDetails]`
+- `do_search_points(vector, filters, include_fields, with_vector) -> list[PointHighDetails]`
+- `do_count(filters: list[dict]) -> int`
+- `do_delete_points_by_filter(filter: dict) -> bool`
 - `do_existence_check() -> bool`
-- `do_create_collection(vector_size: int, distance: str)`
+- `do_create_collection(vector_size: int, distance: str) -> httpx.Response`
 
-`VectorPoint` payload schema (`shared/clients/rag/models/VectorPoint.py`):
+Abstract parser hooks every backend must implement:
+- `_parse_endpoint_points(response, requested_page_size, total_points, current_page) -> PointsListResponse`
+- `_parse_endpoint_points_search(response) -> list[PointHighDetails]`
+- `_parse_endpoint_points_count(response) -> int`
+- `_parse_endpoint_points_upsert(response) -> bool`
+- `_parse_endpoint_points_delete(response) -> bool`
+
+`Point model hierarchy` (`shared/clients/rag/models/Point.py`):
+
+Request models (for upserts):
 ```
-dms_engine, dms_doc_id, chunk_index
-title, owner_id*                     (* MANDATORY — never None)
-created, chunk_text
-label_ids, label_names               ← tags
-category_id, category_name          ← correspondent
-type_id, type_name                   ← document type
-owner_username
+PointDetailsRequest          — dms_doc_id, dms_engine, content_hash
+PointHighDetailsRequest      — extends PointDetailsRequest; adds chunk_index, title, owner_id: str*
+PointUpsert                  — id: str, vector: list[float], payload: PointHighDetailsRequest
 ```
+
+Response models (returned from queries):
+```
+PointBase                    — engine, id
+PointDetails(PointBase)      — metadata without owner_id (for search results)
+PointHighDetails(PointDetails) — full metadata incl. owner_id: str* (MANDATORY), chunk_index
+PointsListResponse           — points, currentPage, nextPage, nextPageId, overallCount
+PointsSearchResponse         — query, points, total
+```
+`*` owner_id type is `str` — never `int`. Raise `ValueError` on upsert if `owner_id` is None.
 
 Point IDs are deterministic:
 `uuid.uuid5(uuid.NAMESPACE_OID, f"{engine}:{doc_id}:{chunk_index}")`
@@ -164,6 +257,30 @@ Factory: `LLMClientManager` — reads `LLM_ENGINE` from env
 
 ---
 
+### `CacheClientInterface` (`shared/clients/cache/CacheClientInterface.py`)
+
+ABC for all cache backends. Used for cross-process caching between the standalone
+SyncService process and the API server.
+
+Key methods:
+- `do_get(key: str) -> str | None` — retrieve; None on miss
+- `do_set(key: str, value: str, ttl_seconds: int | None = None) -> None`
+- `do_delete(key: str) -> None`
+- `do_delete_pattern(pattern: str) -> None` — glob-based bulk deletion
+- `do_exists(key: str) -> bool`
+- `do_get_json(key: str) -> dict | list | None` — convenience wrapper
+- `do_set_json(key: str, value: dict | list, ttl_seconds: int | None = None) -> None`
+
+Key schema constants (defined in interface):
+```
+KEY_FILTER_OPTIONS = "filter_options"   → "filter_options:{owner_id}"
+```
+
+Current implementation: `CacheClientRedis`
+Factory: `CacheClientManager` — reads `CACHE_ENGINE` from env
+
+---
+
 ## Directory Structure
 
 ```
@@ -195,12 +312,16 @@ dms_ai_bridge/
 │   │   │   ├── LLMClientManager.py      ← factory (reflection-based)
 │   │   │   └── ollama/
 │   │   │       └── LLMClientOllama.py
+│   │   ├── cache/
+│   │   │   ├── CacheClientInterface.py  ← cache ABC (get/set/delete/delete_pattern)
+│   │   │   ├── CacheClientManager.py    ← factory (reflection-based)
+│   │   │   └── redis/
+│   │   │       └── CacheClientRedis.py
 │   │   └── rag/
 │   │       ├── RAGClientInterface.py    ← RAG ABC
 │   │       ├── RAGClientManager.py      ← factory (reflection-based)
 │   │       ├── models/
-│   │       │   ├── VectorPoint.py       ← upsert payload (owner_id mandatory)
-│   │       │   └── Scroll.py            ← scroll result model
+│   │       │   └── Point.py             ← all RAG point models (request + response, owner_id mandatory)
 │   │       └── qdrant/
 │   │           └── RAGClientQdrant.py
 │   ├── helper/
@@ -210,29 +331,34 @@ dms_ai_bridge/
 │   └── models/
 │       └── config.py                    ← EnvConfig Pydantic model
 ├── services/
-│   └── dms_rag_sync/
-│       ├── SyncService.py               ← DMS → embed → RAG orchestration
-│       └── dms_rag_sync.py              ← entry point (python -m services.dms_rag_sync)
-└── server/                              ← Phase III/IV — not yet created
-    └── api/
-        ├── api_app.py                   ← FastAPI entry point with lifespan
-        ├── routers/
-        │   ├── WebhookRouter.py         ← POST /webhook/document
-        │   └── QueryRouter.py           ← POST /query
-        ├── services/
-        │   └── QueryService.py          ← embed + scroll + (Phase IV) chat
-        ├── dependencies/
-        │   └── auth.py                  ← X-API-Key verification
-        └── models/
-            ├── requests.py              ← WebhookRequest, SearchRequest
-            └── responses.py             ← SearchResultItem, SearchResponse
+│   ├── dms_rag_sync/
+│   │   ├── SyncService.py               ← DMS → embed → RAG orchestration
+│   │   └── dms_rag_sync.py              ← entry point (python -m services.dms_rag_sync)
+│   └── rag_search/
+│       └── SearchService.py             ← embed → scroll → list[SearchResult] (no FastAPI)
+├── config/
+│   └── user_mapping.yml                 ← frontend/user_id → DMS owner_id mapping
+└── server/
+    ├── api_server.py                    ← FastAPI entry point with lifespan
+    ├── routers/
+    │   ├── WebhookRouter.py             ← POST /webhook/{engine}/document
+    │   └── QueryRouter.py               ← POST /query/{frontend} (thin adapter → SearchService)
+    ├── dependencies/
+    │   ├── auth.py                      ← X-API-Key verification
+    │   └── services.py                  ← FastAPI Depends helpers (get_search_service, …)
+    ├── models/
+    │   ├── requests.py                  ← WebhookRequest, SearchRequest (user_id, not owner_id)
+    │   └── responses.py                 ← SearchResultItem, SearchResponse
+    └── user_mapping/
+        ├── UserMappingService.py        ← resolve(frontend, user_id, engine) → owner_id
+        └── models.py                    ← UserMapping Pydantic models
 ```
 
 ---
 
 ## Agent Responsibilities
 
-Six specialised agents own distinct subsystems. Invoke the correct agent for any task
+Seven specialised agents own distinct subsystems. Invoke the correct agent for any task
 touching that subsystem. Agents that own interfaces must coordinate before changing
 public method signatures.
 
@@ -289,22 +415,46 @@ to `DocumentHighDetails`.
 **Owns:**
 - `shared/clients/rag/RAGClientInterface.py`
 - `shared/clients/rag/RAGClientManager.py`
-- `shared/clients/rag/models/VectorPoint.py`
-- `shared/clients/rag/models/Scroll.py`
+- `shared/clients/rag/models/Point.py`
 - `shared/clients/rag/qdrant/RAGClientQdrant.py`
 
 **Invoke when:**
 adding a new vector DB backend, modifying upsert or search behaviour, changing the
-`VectorPoint` payload schema, debugging Qdrant issues, or adding new filter capabilities
-to `do_scroll()`.
+`Point model hierarchy`, debugging Qdrant issues, or adding new filter capabilities
+to `do_fetch_points()` or `do_search_points()`.
 
 **Key rules:**
 - **Security invariant (non-negotiable):** every upsert must have `owner_id` set; every
-  user-facing scroll must filter by `owner_id`. Raise `ValueError` on upsert if `owner_id`
+  user-facing search must filter by `owner_id`. Raise `ValueError` on upsert if `owner_id`
   is `None`.
 - Point IDs must be deterministic (`uuid5`) — never use random UUIDs
-- `VectorPoint` field names are a stable contract read by api-agent from raw Qdrant
-  payload dicts — coordinate with sync-agent and api-agent before any field rename
+- `Point.py` model field names are a stable contract — coordinate with sync-agent and
+  api-agent before any field rename
+
+---
+
+### `cache-agent` — Cache Client Subsystem
+**Model:** `claude-sonnet-4-6`
+
+**Owns:**
+- `shared/clients/cache/CacheClientInterface.py`
+- `shared/clients/cache/CacheClientManager.py`
+- `shared/clients/cache/redis/CacheClientRedis.py`
+
+**Invoke when:**
+adding a new cache backend, modifying how filter options are stored or invalidated,
+changing cache key schemas, debugging Redis connectivity issues, or adding new
+cacheable data types.
+
+**Key rules:**
+- Cache keys must use the constants defined in `CacheClientInterface` — never hardcode
+  key strings in callers
+- `do_get_json` / `do_set_json` are the preferred API for structured data
+- TTL is always optional; a 24 h safety net is configured via `CACHE_DEFAULT_TTL_SECONDS`
+- `do_delete_pattern("filter_options:*")` must be called by SyncService after full sync
+- `CacheClientRedis` overrides `boot()` / `close()` to manage a `redis.asyncio.Redis`
+  connection — it does NOT use `httpx.AsyncClient`
+- Key schema changes require coordination with service-agent (reader and invalidator)
 
 ---
 
@@ -328,8 +478,8 @@ are sent, debugging embedding or chat API responses, adjusting model configurati
   one request
 - `do_chat()` messages use the OpenAI format (`role`/`content` dicts)
 - `get_chat_payload()` implementations must set `"stream": False`
-- Changing `do_fetch_embedding_vector_size()` tuple order: notify sync-agent and api-agent
-- Changing `do_chat()` return type: notify api-agent
+- Changing `do_fetch_embedding_vector_size()` tuple order: notify service-agent and api-agent
+- Changing `do_chat()` return type: notify service-agent and api-agent
 
 **Adding a new provider:**
 1. Create `shared/clients/llm/{engine_lower}/LLMClient{Engine}.py`
@@ -338,20 +488,29 @@ are sent, debugging embedding or chat API responses, adjusting model configurati
 
 ---
 
-### `sync-agent` — DMS-to-RAG Sync Pipeline
+### `service-agent` — Services Layer
 **Model:** `claude-sonnet-4-6`
 
 **Owns:**
 - `services/dms_rag_sync/SyncService.py`
 - `services/dms_rag_sync/dms_rag_sync.py`
+- `services/rag_search/SearchService.py`
 
 **Invoke when:**
 changing chunking strategy or constants, tuning batch sizes or concurrency, fixing
-sync bugs, modifying `do_incremental_sync()`, or adjusting orphan cleanup logic.
+sync bugs, modifying `do_incremental_sync()`, adjusting orphan cleanup logic, or
+changing search/ranking logic in `SearchService`.
 
 **Key rules:**
-- `do_incremental_sync(document_id: int) -> None` is the public API contract with
-  api-agent's `WebhookRouter` — never change this signature without notifying api-agent
+- `do_incremental_sync(document_id: int, engine: str) -> None` is the public API contract
+  with api-agent's `WebhookRouter` — never change this signature without notifying api-agent
+- `do_search(query: str, owner_id: int, limit: int, chat_history: list[dict] | None) -> list[SearchResult]`
+  is the public API contract with api-agent's `QueryRouter` — never change this signature
+  without notifying api-agent
+- `SearchService` calls `CacheClientInterface` for filter option lookup and
+  `SyncService` calls it for invalidation — cache key contract is owned by cache-agent
+- No FastAPI, Starlette, or Pydantic response models in any service — keep them
+  framework-agnostic and reusable outside the server context
 - Skip documents without `owner_id` (security gate — no silent writes)
 - Chunking: character-level only (`CHUNK_SIZE=1000`, `CHUNK_OVERLAP=100`), no tokenisation
 - Concurrency: always `asyncio.Semaphore(DOC_CONCURRENCY=5)` — never unbounded `gather()`
@@ -364,38 +523,47 @@ sync bugs, modifying `do_incremental_sync()`, or adjusting orphan cleanup logic.
 ### `api-agent` — FastAPI Server (Phase III/IV)
 **Model:** `claude-opus-4-6`
 
-**Owns:** (all files pending — must be created)
-- `server/api/api_app.py` — FastAPI entry point with lifespan
-- `server/api/routers/WebhookRouter.py` — `POST /webhook/document`
-- `server/api/routers/QueryRouter.py` — `POST /query`
-- `server/api/services/QueryService.py` — embed → scroll → `SearchResponse`
-- `server/api/dependencies/auth.py` — `X-API-Key` verification
-- `server/api/models/requests.py` — `WebhookRequest`, `SearchRequest`
-- `server/api/models/responses.py` — `SearchResultItem`, `SearchResponse`
+**Owns:**
+- `server/api_server.py` — FastAPI entry point with lifespan
+- `server/routers/WebhookRouter.py` — `POST /webhook/{engine}/document`
+- `server/routers/QueryRouter.py` — `POST /query/{frontend}` (thin adapter over `SearchService`)
+- `server/dependencies/auth.py` — `X-API-Key` verification
+- `server/dependencies/services.py` — FastAPI `Depends` helpers
+- `server/models/requests.py` — `WebhookRequest`, `SearchRequest`
+- `server/models/responses.py` — `SearchResultItem`, `SearchResponse`
+- `server/user_mapping/UserMappingService.py` — loads `config/user_mapping.yml`, resolves user identities
+- `server/user_mapping/models.py` — `UserMapping` Pydantic models
 
 **Invoke when:**
-creating the FastAPI app, adding routes, building `QueryService`, integrating LangChain
-for Phase IV, or implementing auth middleware.
+creating the FastAPI app, adding routes, wiring `SearchService` into `QueryRouter`,
+implementing `UserMappingService`, integrating LangChain for Phase IV, or implementing
+auth middleware.
 
 **Key rules:**
 - All route handlers: `async def`
-- Clients accessed only via `request.app.state.*` — never instantiate in handlers
-- `owner_id` is mandatory on `SearchRequest` — enforced at Pydantic model level
+- Clients and services accessed only via `request.app.state.*` — never instantiate in handlers
+- `user_id` (external frontend ID) comes from the request body; `owner_id` (DMS-internal) is
+  resolved via `UserMappingService.resolve()` in the router — never pass raw `user_id` to
+  `SearchService` or any RAG/DMS call
+- Missing mapping → HTTP 403, never fall back to a default owner
 - Use `BackgroundTasks` for the webhook — never `asyncio.create_task()` in route handlers
-- Every subdirectory under `server/api/` needs `__init__.py` for uvicorn module resolution
-- Phase III: `POST /query` uses `do_scroll()` with payload filter, `score=0.0` placeholder
+- `QueryRouter` is a thin adapter: resolve user_id → owner_id → call `SearchService.do_search()` →
+  map `list[SearchResult]` to `SearchResponse` — no embed, scroll, or LLM logic in the router
+- Every subdirectory under `server/` needs `__init__.py` for uvicorn module resolution
 - Phase IV: use `WebSearch` to look up current `create_react_agent` API before implementing
 
 **API contracts:**
 ```
-POST /webhook/document
+POST /webhook/{engine}/document
   Request:  {"document_id": 42}
   Response: {"status": "accepted", "document_id": 42}
-  Action:   background_tasks.add_task(sync_service.do_incremental_sync, document_id)
+  Action:   background_tasks.add_task(sync_service.do_incremental_sync, document_id, engine)
 
-POST /query
-  Request:  {"query": "...", "owner_id": 1, "limit": 5}
+POST /query/{frontend}
+  Path:     frontend — AI system identifier ("openwebui", "anythingllm", …)
+  Request:  {"query": "...", "user_id": "5", "limit": 5, "chat_history": [...]}
   Response: {"query": "...", "results": [...], "total": N}
+  Mapping:  UserMappingService.resolve(frontend, user_id, engine) → owner_id (or 403)
 ```
 
 ---
@@ -468,6 +636,9 @@ DMS_PAPERLESS_BASE_URL     DMS_PAPERLESS_API_KEY
 RAG_QDRANT_BASE_URL        RAG_QDRANT_COLLECTION
 LLM_OLLAMA_BASE_URL        LLM_OLLAMA_API_KEY
 LLM_MODEL_EMBEDDING        LLM_MODEL_CHAT         LLM_DISTANCE
+CACHE_REDIS_BASE_URL       CACHE_REDIS_PASSWORD   CACHE_REDIS_DB
+CACHE_DEFAULT_TTL_SECONDS  LLM_MAX_FILTER_VALUES_PER_CATEGORY
+USER_MAPPING_FILE          (path to user_mapping.yml, default: config/user_mapping.yml)
 ```
 
 Never call `os.getenv()` directly in business logic — always use `HelperConfig`.
@@ -490,11 +661,13 @@ All code, variable names, comments, docstrings, and log messages: **English**.
 |---|---|
 | `HelperConfig`, `ClientInterface`, logging, Docker, `requirements.txt` | `infra-agent` |
 | Paperless API, `DMSClientInterface`, `DocumentHighDetails`, DMS models | `dms-agent` |
-| Qdrant, `RAGClientInterface`, `VectorPoint`, scroll filters | `rag-agent` |
+| Qdrant, `RAGClientInterface`, `Point.py` models, point filters | `rag-agent` |
+| Redis, `CacheClientInterface`, filter option cache, cache invalidation | `cache-agent` |
 | Ollama, `LLMClientInterface`, embedding, chat, new LLM provider | `embed-llm-agent` |
-| Chunking, sync pipeline, `SyncService`, orphan cleanup | `sync-agent` |
-| FastAPI routes, `QueryService`, webhook, auth, Phase III/IV server | `api-agent` |
+| Sync pipeline, `SyncService`, `SearchService`, orphan cleanup | `service-agent` |
+| FastAPI routes, `QueryRouter`, webhook, auth, Phase III/IV server | `api-agent` |
+| `UserMappingService`, `user_mapping.yml`, frontend/user_id resolution | `api-agent` |
 
-**Cross-cutting changes** (e.g. adding a field to `VectorPoint`, changing a `ClientInterface`
+**Cross-cutting changes** (e.g. adding a field to `Point.py` models, changing a `ClientInterface`
 abstract method) require coordinating the relevant agents before merging — see each agent's
 "Coordination points" section in `.claude/agents/`.

@@ -13,13 +13,17 @@ from shared.helper.HelperConfig import HelperConfig
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.rag.RAGClientInterface import RAGClientInterface
 from shared.clients.llm.LLMClientInterface import LLMClientInterface
+from shared.clients.cache.CacheClientInterface import CacheClientInterface
+from shared.clients.cache.CacheClientManager import CacheClientManager
 from shared.clients.dms.DMSClientManager import DMSClientManager
 from shared.clients.rag.RAGClientManager import RAGClientManager
 from shared.clients.llm.LLMClientManager import LLMClientManager
+from shared.clients.ClientInterface import ClientInterface
 from services.dms_rag_sync.SyncService import SyncService
-from server.core.QueryService import QueryService
+from services.rag_search.SearchService import SearchService
 from server.routers.WebhookRouter import router as webhook_router
 from server.routers.QueryRouter import router as query_router
+from server.user_mapping.UserMappingService import UserMappingService
 
 logging = setup_logging()
 app_version = os.getenv("APP_VERSION", "unknown")
@@ -34,29 +38,35 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     dms_clients = DMSClientManager(helper_config=app.state.helper_config).get_clients()
     rag_clients = RAGClientManager(helper_config=app.state.helper_config).get_clients()
     llm_client = LLMClientManager(helper_config=app.state.helper_config).get_client()
+    cache_client = CacheClientManager(helper_config=app.state.helper_config).get_client()
+    _clients :list[ClientInterface] = [*dms_clients, *rag_clients, llm_client, cache_client]
 
     logging.info("Booting all clients...")
-    for client in [*dms_clients, *rag_clients, llm_client]:
+    for client in _clients:
         await client.boot()
-    logging.info("All clients booted successfully.")
-
     app.state.dms_clients = dms_clients
     app.state.rag_clients = rag_clients
     app.state.llm_client = llm_client
+    app.state.cache_client = cache_client
+    await check_connections(dms_clients, rag_clients, llm_client, cache_client)
+    logging.info("All clients booted successfully.", color="green")
 
+    logging.info("Loading all services...")
     app.state.sync_service = SyncService(
         helper_config=app.state.helper_config,
         dms_clients=dms_clients,
         rag_clients=rag_clients,
         embed_client=llm_client,
+        cache_client=cache_client,
     )
-    app.state.query_service = QueryService(
+    app.state.search_service = SearchService(
         helper_config=app.state.helper_config,
         rag_clients=rag_clients,
         llm_client=llm_client,
+        cache_client=cache_client,
     )
-
-    await check_connections(dms_clients, rag_clients, llm_client)
+    app.state.user_mapping_service = UserMappingService()
+    logging.info("All services loaded successfully.", color="green")
 
     # while the app is running...
     yield
@@ -65,6 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logging.info("Shutting down — closing all clients...")
     for client in [*dms_clients, *rag_clients, llm_client]:
         await client.close()
+    await cache_client.close()
     logging.info("All clients closed.")
 
 
@@ -96,38 +107,45 @@ async def check_connections(
     dms_clients: list[DMSClientInterface],
     rag_clients: list[RAGClientInterface],
     llm_client: LLMClientInterface,
+    cache_client: CacheClientInterface,
 ) -> None:
     """Check connectivity to all configured backends on startup.
 
-    DMS failures are non-fatal (sync will fail later, but the server stays up).
+    DMS and cache failures are non-fatal (sync/search degrade gracefully).
     RAG and LLM failures are fatal — queries cannot be served without them.
 
     Raises:
         Exception: If a critical service (RAG or LLM) is not reachable.
     """
     for client in dms_clients:
-        result: httpx.Response = await client.do_healthcheck()
+        result = await client.do_healthcheck()
         if not result.is_success:
-            logging.warning(
-                "DMS client '%s' is not reachable (status %d). Document sync may fail.",
-                client.__class__.__name__,
-                result.status_code,
+            raise Exception(
+                f"DMS client '{client.get_engine_name()}' is not reachable "
+                f"(status {result.status_code}). Cannot serve queries."
             )
 
     for client in rag_clients:
         result = await client.do_healthcheck()
         if not result.is_success:
             raise Exception(
-                f"RAG client '{client.__class__.__name__}' is not reachable "
+                f"RAG client '{client.get_engine_name()}' is not reachable "
                 f"(status {result.status_code}). Cannot serve queries."
             )
 
     result = await llm_client.do_healthcheck()
     if not result.is_success:
         raise Exception(
-            f"LLM client is not reachable (status {result.status_code}). "
-            "Embedding and chat will not work."
-        )
+                f"LLM client '{llm_client.get_engine_name()}' is not reachable "
+                f"(status {result.status_code}). Cannot serve queries."
+            )
+
+    result = await cache_client.do_healthcheck()
+    if not result.is_success:
+        raise Exception(
+                f"Cache client '{cache_client.get_engine_name()}' is not reachable "
+                f"(status {result.status_code}). Cannot serve queries."
+            )
 
 
 if __name__ == "__main__":

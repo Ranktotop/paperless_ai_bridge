@@ -236,10 +236,11 @@ class DMSClientInterface(ClientInterface):
             resp = await self.do_request(method="GET", endpoint=self._get_endpoint_documents(page=page, page_size=page_size))
             documents_list_response = self._parse_endpoint_documents(resp.json(), requested_page_size=page_size)
             documents.extend(documents_list_response.documents)
-            self.logging.info("Fetched documents page %d of %d from %s, total documents so far: %d of %d", page, documents_list_response.lastPage, self._get_engine_name(), len(documents), documents_list_response.overallCount)
+            self.logging.debug("Fetched documents page %d of %d from %s, total documents so far: %d of %d", page, documents_list_response.lastPage, self._get_engine_name(), len(documents), documents_list_response.overallCount)
             page = documents_list_response.nextPage
             if not page:
-                break            
+                break     
+        self.logging.info("Fetched all documents from %s, total documents: %d.", self._get_engine_name(), len(documents))                  
         return documents
     
     async def do_fetch_correspondents(self) -> list[CorrespondentBase]:
@@ -259,10 +260,11 @@ class DMSClientInterface(ClientInterface):
             resp = await self.do_request(method="GET", endpoint=self._get_endpoint_correspondents(page=page, page_size=page_size))
             correspondents_list_response = self._parse_endpoint_correspondents(resp.json(), requested_page_size=page_size)
             correspondents.extend(correspondents_list_response.correspondents)
-            self.logging.info("Fetched correspondents page %d of %d from %s, total correspondents so far: %d of %d", page, correspondents_list_response.lastPage, self._get_engine_name(), len(correspondents), correspondents_list_response.overallCount)
+            self.logging.debug("Fetched correspondents page %d of %d from %s, total correspondents so far: %d of %d", page, correspondents_list_response.lastPage, self._get_engine_name(), len(correspondents), correspondents_list_response.overallCount)
             page = correspondents_list_response.nextPage
             if not page:
-                break            
+                break        
+        self.logging.info("Fetched all correspondents from %s, total correspondents: %d.", self._get_engine_name(), len(correspondents))               
         return correspondents
     
     async def do_fetch_owners(self) -> list[OwnerBase]:
@@ -282,10 +284,11 @@ class DMSClientInterface(ClientInterface):
             resp = await self.do_request(method="GET", endpoint=self._get_endpoint_owners(page=page, page_size=page_size))
             owners_list_response = self._parse_endpoint_owners(resp.json(), requested_page_size=page_size)
             owners.extend(owners_list_response.owners)
-            self.logging.info("Fetched owners page %d of %d from %s, total owners so far: %d of %d", page, owners_list_response.lastPage, self._get_engine_name(), len(owners), owners_list_response.overallCount)
+            self.logging.debug("Fetched owners page %d of %d from %s, total owners so far: %d of %d", page, owners_list_response.lastPage, self._get_engine_name(), len(owners), owners_list_response.overallCount)
             page = owners_list_response.nextPage
             if not page:
-                break            
+                break 
+        self.logging.info("Fetched all owners from %s, total owners: %d.", self._get_engine_name(), len(owners))           
         return owners
     
     async def do_fetch_tags(self) -> list[TagBase]:
@@ -305,10 +308,11 @@ class DMSClientInterface(ClientInterface):
             resp = await self.do_request(method="GET", endpoint=self._get_endpoint_tags(page=page, page_size=page_size))
             tags_list_response = self._parse_endpoint_tags(resp.json(), requested_page_size=page_size)
             tags.extend(tags_list_response.tags)
-            self.logging.info("Fetched tags page %d of %d from %s, total tags so far: %d of %d", page, tags_list_response.lastPage, self._get_engine_name(), len(tags), tags_list_response.overallCount)
+            self.logging.debug("Fetched tags page %d of %d from %s, total tags so far: %d of %d", page, tags_list_response.lastPage, self._get_engine_name(), len(tags), tags_list_response.overallCount)
             page = tags_list_response.nextPage
             if not page:
-                break            
+                break         
+        self.logging.info("Fetched all tags from %s, total tags: %d.", self._get_engine_name(), len(tags))              
         return tags
     
     async def do_fetch_document_types(self) -> list[DocumentTypeBase]:
@@ -328,10 +332,11 @@ class DMSClientInterface(ClientInterface):
             resp = await self.do_request(method="GET", endpoint=self._get_endpoint_document_types(page=page, page_size=page_size))
             document_types_list_response = self._parse_endpoint_document_types(resp.json(), requested_page_size=page_size)
             document_types.extend(document_types_list_response.types)
-            self.logging.info("Fetched document types page %d of %d from %s, total document types so far: %d of %d", page, document_types_list_response.lastPage, self._get_engine_name(), len(document_types), document_types_list_response.overallCount)
+            self.logging.debug("Fetched document types page %d of %d from %s, total document types so far: %d of %d", page, document_types_list_response.lastPage, self._get_engine_name(), len(document_types), document_types_list_response.overallCount)
             page = document_types_list_response.nextPage
             if not page:
                 break            
+        self.logging.info("Fetched all document types from %s, total document types: %d.", self._get_engine_name(), len(document_types))              
         return document_types
     
     

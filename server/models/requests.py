@@ -7,5 +7,6 @@ class WebhookRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    owner_id: int
-    limit: int = 5
+    user_id: str
+    limit: int = 10
+    chat_history: list[dict] = []

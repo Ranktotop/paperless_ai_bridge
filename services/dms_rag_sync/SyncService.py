@@ -9,16 +9,17 @@ import asyncio
 import hashlib
 import uuid
 
+from shared.clients.cache.CacheClientInterface import CacheClientInterface, KEY_FILTER_OPTIONS
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.models.Document import DocumentHighDetails
 from shared.clients.rag.RAGClientInterface import RAGClientInterface
-from shared.clients.rag.models.VectorPoint import VectorPoint
+from shared.clients.rag.models.Point import PointHighDetailsRequest, PointUpsert
 from shared.clients.llm.LLMClientInterface import LLMClientInterface
 from shared.helper.HelperConfig import HelperConfig
 
 CHUNK_SIZE = 1000       # characters per text chunk
 CHUNK_OVERLAP = 100     # character overlap between consecutive chunks
-UPSERT_BATCH_SIZE = 100 # max points per Qdrant upsert call
+UPSERT_BATCH_SIZE = 100 # max points per RAG upsert call
 DOC_CONCURRENCY = 5     # max parallel document syncs
 
 
@@ -69,7 +70,7 @@ def _compute_doc_hash(doc: DocumentHighDetails) -> str:
 
 
 def _make_point_id(engine: str, doc_id: str, chunk_index: int) -> str:
-    """Build a deterministic UUID5 point ID for a Qdrant vector.
+    """Build a deterministic UUID5 point ID for a RAG vector.
 
     Using UUID5 ensures the same document chunk always maps to the same
     point ID so that re-syncing overwrites rather than duplicates.
@@ -80,7 +81,7 @@ def _make_point_id(engine: str, doc_id: str, chunk_index: int) -> str:
         chunk_index (int): Zero-based chunk index within the document.
 
     Returns:
-        str: UUID string usable as a Qdrant point ID.
+        str: UUID string usable as a RAG point ID.
     """
     return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{engine}:{doc_id}:{chunk_index}"))
 
@@ -94,11 +95,13 @@ class SyncService:
         dms_clients: list[DMSClientInterface],
         rag_clients: list[RAGClientInterface],
         embed_client: LLMClientInterface,
+        cache_client: CacheClientInterface,
     ) -> None:
         self.logging = helper_config.get_logger()
         self._dms_clients = dms_clients
         self._rag_clients = rag_clients
         self._embed_client = embed_client
+        self._cache_client = cache_client
 
     ##########################################
     ############### CORE SYNC ################
@@ -112,83 +115,107 @@ class SyncService:
             for rag_client in self._rag_clients:
                 await self.do_sync(rag_client, dms_client)
 
-    async def do_incremental_sync(self, document_id: int) -> None:
-        """Fetch and re-sync a single document identified by its DMS ID.
+    async def do_incremental_sync(self, document_id: int, engine: str) -> None:
+        """Fetch and re-sync a single document identified by its DMS ID and engine name.
 
-        Called by the webhook handler after Paperless-ngx signals that a document
-        has been created or updated. The method re-fetches the document from every
-        DMS client, resolves its metadata from the existing cache, builds a
-        DocumentHighDetails object, and passes it to _sync_document with an empty
-        rag_hashes dict so that the document is always re-embedded.
+        Called by the webhook handler after a DMS signals that a document has been
+        created or updated. The ``engine`` parameter identifies exactly which DMS
+        client to use; if no registered client matches, the method logs an error
+        and returns immediately without touching any RAG backend.
 
-        Errors for individual DMS/RAG combinations are caught and logged so that
-        the webhook can always return 202 Accepted.
+        The matching DMS client re-fetches the document, resolves its metadata from
+        the existing cache, builds a DocumentHighDetails object, and passes it to
+        _sync_document with an empty rag_hashes dict so that the document is always
+        re-embedded regardless of its stored content hash.
+
+        Errors for individual RAG combinations are caught and logged so that the
+        webhook can always return 202 Accepted.
 
         Args:
             document_id (int): DMS document ID to sync.
+            engine (str): DMS engine name (e.g. "paperless") that identifies which
+                registered DMS client should handle this document. Must match the
+                value returned by ``DMSClientInterface.get_engine_name()``.
         """
         self.logging.info("Starting incremental sync for document id=%d...", document_id)
         sem = asyncio.Semaphore(DOC_CONCURRENCY)
 
-        for dms_client in self._dms_clients:
-            engine = dms_client.get_engine_name()
+        dms_client = next(
+            (c for c in self._dms_clients if c.get_engine_name().lower() == engine.lower()), None
+        )
+        if dms_client is None:
+            self.logging.error(
+                "Incremental sync: no DMS client registered for engine '%s'.", engine
+            )
+            return
+
+        try:
+            # ensure reference caches are populated (no-op if already filled)
+            await dms_client.fill_cache(force_refresh=False)
+
+            # fetch fresh document details from the DMS
+            doc_details = await dms_client.do_fetch_document_details(str(document_id))
+
+            # resolve metadata from caches
+            correspondent = None
+            owner = None
+            tags = []
+            document_type = None
+
+            if doc_details.correspondent_id and dms_client._cache_correspondents:
+                correspondent = dms_client._cache_correspondents.get(doc_details.correspondent_id)
+            if doc_details.owner_id and dms_client._cache_owners:
+                owner = dms_client._cache_owners.get(doc_details.owner_id)
+            if doc_details.tag_ids and dms_client._cache_tags:
+                for tag_id in doc_details.tag_ids:
+                    tag = dms_client._cache_tags.get(tag_id)
+                    if tag:
+                        tags.append(tag)
+            if doc_details.document_type_id and dms_client._cache_document_types:
+                document_type = dms_client._cache_document_types.get(doc_details.document_type_id)
+
+            doc = DocumentHighDetails(
+                **doc_details.model_dump(),
+                correspondent=correspondent,
+                owner=owner,
+                tags=tags,
+                document_type=document_type,
+            )
+        except Exception as exc:
+            self.logging.error(
+                "Incremental sync: failed to fetch/build document id=%d from DMS '%s': %s",
+                document_id, engine, exc,
+            )
+            return
+
+        # look up the old owner_id from RAG before syncing so we can detect
+        # owner loss or change and invalidate the previous cache entry afterwards
+        old_owner_id: int | None = await self._fetch_owner_of_document(
+            self._rag_clients[0], engine, str(document_id)
+        )
+
+        for rag_client in self._rag_clients:
             try:
-                # ensure reference caches are populated (no-op if already filled)
-                await dms_client.fill_cache(force_refresh=False)
-
-                # fetch fresh document details from the DMS
-                doc_details = await dms_client.do_fetch_document_details(str(document_id))
-
-                # resolve metadata from caches
-                correspondent = None
-                owner = None
-                tags = []
-                document_type = None
-
-                if doc_details.correspondent_id and dms_client._cache_correspondents:
-                    correspondent = dms_client._cache_correspondents.get(doc_details.correspondent_id)
-                if doc_details.owner_id and dms_client._cache_owners:
-                    owner = dms_client._cache_owners.get(doc_details.owner_id)
-                if doc_details.tag_ids and dms_client._cache_tags:
-                    for tag_id in doc_details.tag_ids:
-                        tag = dms_client._cache_tags.get(tag_id)
-                        if tag:
-                            tags.append(tag)
-                if doc_details.document_type_id and dms_client._cache_document_types:
-                    document_type = dms_client._cache_document_types.get(doc_details.document_type_id)
-
-                doc = DocumentHighDetails(
-                    **doc_details.model_dump(),
-                    correspondent=correspondent,
-                    owner=owner,
-                    tags=tags,
-                    document_type=document_type,
-                )
+                result = await self._sync_document(doc, rag_client, dms_client, sem, {})
+                if result:
+                    self.logging.info(
+                        "Incremental sync complete for document id=%d in DMS '%s' → RAG '%s'.",
+                        document_id, engine, rag_client.get_engine_name(),
+                    )
+                else:
+                    self.logging.info(
+                        "Incremental sync: document id=%d in DMS '%s' was skipped (no content or missing owner_id).",
+                        document_id, engine,
+                    )
             except Exception as exc:
                 self.logging.error(
-                    "Incremental sync: failed to fetch/build document id=%d from DMS '%s': %s",
-                    document_id, engine, exc,
+                    "Incremental sync: failed to sync document id=%d to RAG '%s': %s",
+                    document_id, rag_client.get_engine_name(), exc,
                 )
-                continue
 
-            for rag_client in self._rag_clients:
-                try:
-                    result = await self._sync_document(doc, rag_client, dms_client, sem, {})
-                    if result:
-                        self.logging.info(
-                            "Incremental sync complete for document id=%d in DMS '%s' → RAG '%s'.",
-                            document_id, engine, rag_client.get_engine_name(),
-                        )
-                    else:
-                        self.logging.info(
-                            "Incremental sync: document id=%d in DMS '%s' was skipped (no content or missing owner_id).",
-                            document_id, engine,
-                        )
-                except Exception as exc:
-                    self.logging.error(
-                        "Incremental sync: failed to sync document id=%d to RAG '%s': %s",
-                        document_id, rag_client.get_engine_name(), exc,
-                    )
+        # update filter cache — pass the old owner_id so a lost/changed owner
+        # causes the previous cache entry to be invalidated
+        await self._merge_filter_cache(doc, old_owner_id=old_owner_id)
 
     async def do_sync(self, rag_client: RAGClientInterface, dms_client: DMSClientInterface) -> None:
         """Sync documents from a single DMS client to a single RAG client.
@@ -229,14 +256,18 @@ class SyncService:
         synced = sum(1 for r in results if r is True)
         skipped = sum(1 for r in results if r is False)
         errors = sum(1 for r in results if isinstance(r, Exception))
+        color = "green" if errors == 0 and skipped == 0 else "yellow" if errors == 0 else "red"
         self.logging.info(
             "Sync complete for '%s': %d synced, %d skipped, %d errors.",
-            engine, synced, skipped, errors,
+            engine, synced, skipped, errors, color=color
         )
 
         # clean up orphaned vectors in the RAG backend
         dms_ids = {doc.id for doc in enriched_docs}
         await self._cleanup_orphans(rag_client, engine, dms_ids)
+
+        # rebuild filter option cache from the already-fetched document data
+        await self._update_filter_cache(enriched_docs)
 
     ##########################################
     ############ DOCUMENT SYNC ###############
@@ -265,9 +296,9 @@ class SyncService:
             dict[str, str]: Mapping of dms_doc_id → content_hash for all known points.
         """
         try:
-            scroll_result = await rag_client.do_scroll_all(
+            points = await rag_client.do_fetch_points(
                 filters=[{"key": "dms_engine", "match": {"value": engine}}],
-                with_payload=["dms_doc_id", "content_hash"],
+                include_fields=["dms_doc_id", "content_hash"],
                 with_vector=False,
             )
         except Exception as exc:
@@ -278,12 +309,11 @@ class SyncService:
             return {}
 
         hashes: dict[str, str] = {}
-        for point in scroll_result.result:
-            payload = point.get("payload") or {}
-            doc_id = payload.get("dms_doc_id")
-            content_hash = payload.get("content_hash")
-            if doc_id is not None and content_hash is not None:
-                hashes[str(doc_id)] = content_hash
+        for point in points:
+            doc_id = point.dms_doc_id
+            content_hash = point.content_hash
+            if doc_id and content_hash is not None:
+                hashes[doc_id] = content_hash
         return hashes
 
     async def _delete_document_vectors(
@@ -309,7 +339,9 @@ class SyncService:
                     {"key": "dms_doc_id", "match": {"value": doc_id}},
                 ]
             }
-            await rag_client.do_delete_points_by_filter(delete_filter)
+            success = await rag_client.do_delete_points_by_filter(delete_filter)
+            if not success:
+                raise Exception("RAG client reported delete failure for document id=%s." % doc_id)
         except Exception as exc:
             self.logging.error(
                 "Failed to delete vectors for document id=%s: %s", doc_id, exc
@@ -346,13 +378,13 @@ class SyncService:
 
         # skip documents without OCR text
         if not doc.content or not doc.content.strip():
-            self.logging.info("Skipping document id=%s ('%s'): no content.", doc.id, doc.title, color="yellow")
+            self.logging.warning("Skipping document id=%s ('%s'): no content.", doc.id, doc.title, color="yellow")
             await self._delete_document_vectors(rag_client, engine, doc.id)
             return None
 
         chunks = _split_text(doc.content)
         if not chunks:
-            self.logging.info(
+            self.logging.warning(
                 "Skipping document id=%s ('%s'): content produced no chunks.", doc.id, doc.title, color="yellow"
             )
             await self._delete_document_vectors(rag_client, engine, doc.id)
@@ -417,7 +449,9 @@ class SyncService:
                         {"key": "dms_doc_id", "match": {"value": doc.id}},
                     ]
                 }
-                await rag_client.do_delete_points_by_filter(delete_filter)
+                success = await rag_client.do_delete_points_by_filter(delete_filter)
+                if not success:
+                    raise Exception("RAG client reported delete failure for document id=%s." % doc.id)
             except Exception as exc:
                 self.logging.error(
                     "Delete-before-upsert failed for document id=%s: %s", doc.id, exc, color="red"
@@ -425,9 +459,9 @@ class SyncService:
                 raise
 
             # build RAG points
-            points: list[dict] = []
+            points: list[PointUpsert] = []
             for chunk_index, (chunk, vector) in enumerate(zip(chunks, vectors)):
-                payload = VectorPoint(
+                payload = PointHighDetailsRequest(
                     dms_engine=engine,
                     dms_doc_id=doc.id,
                     chunk_index=chunk_index,
@@ -444,17 +478,19 @@ class SyncService:
                     chunk_text=chunk,
                     content_hash=current_hash,
                 )
-                points.append({
-                    "id": _make_point_id(engine, doc.id, chunk_index),
-                    "vector": vector,
-                    "payload": payload.model_dump(),
-                })
+                points.append(PointUpsert(
+                    id=_make_point_id(engine, doc.id, chunk_index),
+                    vector=vector,
+                    payload=payload,
+                ))
 
             # upsert in batches to avoid oversized requests
             try:
                 for batch_start in range(0, len(points), UPSERT_BATCH_SIZE):
                     batch = points[batch_start: batch_start + UPSERT_BATCH_SIZE]
-                    await rag_client.do_upsert_points(batch)
+                    success = await rag_client.do_upsert_points(batch)
+                    if not success:
+                        raise Exception("RAG client reported upsert failure for batch starting at index %d." % batch_start)
             except Exception as exc:
                 self.logging.error(
                     "Upsert failed for document id=%s: %s", doc.id, exc, color="red"
@@ -491,22 +527,20 @@ class SyncService:
 
         rag_doc_ids: set[str] = set()
         try:
-            scroll_result = await rag_client.do_scroll_all(
+            points = await rag_client.do_fetch_points(
                 filters=[{"key": "dms_engine", "match": {"value": engine}}],
-                with_payload=["dms_doc_id"],
+                include_fields=["dms_doc_id"],
                 with_vector=False,
             )
-            for point in scroll_result.result:
-                doc_id = (point.get("payload") or {}).get("dms_doc_id")
-                if doc_id is not None:
-                    rag_doc_ids.add(str(doc_id))
+            for point in points:
+                rag_doc_ids.add(point.dms_doc_id)
         except Exception as exc:
-            self.logging.error("Orphan cleanup scroll failed: %s. Skipping cleanup.", exc)
+            self.logging.error("Orphan cleanup scroll failed: %s. Skipping cleanup.", exc, color="red")
             return
 
         orphan_ids = rag_doc_ids - dms_ids
         if not orphan_ids:
-            self.logging.info("Orphan cleanup: no stale documents found.")
+            self.logging.info("Orphan cleanup: no stale documents found.", color="green")
             return
 
         self.logging.info("Orphan cleanup: removing vectors for %d stale document(s).", len(orphan_ids))
@@ -519,12 +553,181 @@ class SyncService:
                         {"key": "dms_doc_id", "match": {"value": orphan_id}},
                     ]
                 }
-                await rag_client.do_delete_points_by_filter(delete_filter)
+                success = await rag_client.do_delete_points_by_filter(delete_filter)
+                if not success:
+                    raise Exception("RAG client reported delete failure for document id=%s." % orphan_id)
                 removed += 1
             except Exception as exc:
                 self.logging.error(
                     "Orphan cleanup: failed to delete vectors for engine='%s' dms_doc_id=%s: %s",
-                    engine, orphan_id, exc,
+                    engine, orphan_id, exc, color="red"
                 )
 
-        self.logging.info("Orphan cleanup complete: removed vectors for %d document(s).", removed)
+        self.logging.info("Orphan cleanup complete: removed vectors for %d document(s).", removed, color="green")
+
+    ##########################################
+    ############# HELPERS ####################
+    ##########################################
+
+    async def _fetch_owner_of_document(
+        self,
+        rag_client: RAGClientInterface,
+        engine: str,
+        doc_id: str,
+    ) -> int | None:
+        """Return the owner_id stored in RAG for a document before syncing.
+
+        Used by do_incremental_sync() to detect owner loss or change so the old
+        owner's filter cache entry can be invalidated.
+
+        Args:
+            rag_client: The RAG client to query.
+            engine: DMS engine identifier used in the filter.
+            doc_id: Document ID whose current RAG owner_id to retrieve.
+
+        Returns:
+            The stored owner_id as int, or None if not found or on error.
+        """
+        try:
+            points = await rag_client.do_fetch_points(
+                filters=[
+                    {"key": "dms_engine", "match": {"value": engine}},
+                    {"key": "dms_doc_id", "match": {"value": doc_id}},
+                ],
+                include_fields=["owner_id"],
+                with_vector=False,
+            )
+            if points:
+                return int(points[0].owner_id)
+        except Exception as exc:
+            self.logging.warning(
+                "Could not fetch current owner_id for document id=%s from RAG: %s", doc_id, exc
+            )
+        return None
+
+    async def _merge_filter_cache(
+        self,
+        doc: DocumentHighDetails,
+        old_owner_id: int | None = None,
+    ) -> None:
+        """Merge a single document's metadata values into the owner's filter cache entry.
+
+        Reads the existing cached options for the new owner, adds any new values
+        from the document, and writes back. If the owner changed or was removed,
+        the old owner's cache entry is invalidated so SearchService rebuilds it.
+
+        This is intentionally additive only: values removed from a document via an
+        update are not pruned here. The next full sync rebuilds the cache from scratch
+        and corrects any stale entries.
+
+        Args:
+            doc: The enriched document that was just synced.
+            old_owner_id: The owner_id the document had in RAG before this sync,
+                          used to invalidate the previous cache entry on owner change.
+        """
+        # invalidate old owner's cache if the owner changed or was lost
+        if old_owner_id is not None and old_owner_id != doc.owner_id:
+            try:
+                old_key = "%s:%s:%d" % (KEY_FILTER_OPTIONS, doc.engine, old_owner_id)
+                await self._cache_client.do_delete(old_key)
+                self.logging.debug(
+                    "Filter cache invalidated for engine=%s, old owner_id=%d after owner change on document id=%s.",
+                    doc.engine, old_owner_id, doc.id,
+                )
+            except Exception as exc:
+                self.logging.warning(
+                    "Failed to invalidate old filter cache for engine=%s, owner_id=%d: %s",
+                    doc.engine, old_owner_id, exc,
+                )
+
+        if not doc.owner_id:
+            return
+
+        cache_key = "%s:%s:%d" % (KEY_FILTER_OPTIONS, doc.engine, doc.owner_id)
+        try:
+            existing = await self._cache_client.do_get_json(cache_key) or {}
+            correspondents: set[str] = set(existing.get("correspondents") or [])
+            document_types: set[str] = set(existing.get("document_types") or [])
+            tags: set[str] = set(existing.get("tags") or [])
+
+            if doc.correspondent and doc.correspondent.name:
+                correspondents.add(doc.correspondent.name)
+            if doc.document_type and doc.document_type.name:
+                document_types.add(doc.document_type.name)
+            for tag in (doc.tags or []):
+                if tag.name:
+                    tags.add(tag.name)
+
+            options = {
+                "correspondents": sorted(correspondents),
+                "document_types": sorted(document_types),
+                "tags": sorted(tags),
+            }
+            await self._cache_client.do_set_json(cache_key, options)
+            self.logging.debug(
+                "Filter cache merged for engine=%s, owner_id=%d after incremental sync of document id=%s.",
+                doc.engine, doc.owner_id, doc.id,
+            )
+        except Exception as exc:
+            self.logging.warning(
+                "Failed to merge filter cache for owner_id=%d: %s", doc.owner_id, exc
+            )
+
+    async def _update_filter_cache(self, enriched_docs: list[DocumentHighDetails]) -> None:
+        """Build per-owner filter options from enriched documents and write to cache.
+
+        Groups documents by owner_id, collects distinct correspondent names,
+        document type names, and tag names, then writes one cache entry per owner.
+        This is called after a full sync when all DMS data is already in memory.
+
+        Args:
+            enriched_docs: All enriched documents returned by the DMS client.
+        """
+        # wipe all existing filter option entries before rebuilding from scratch
+        # so that owners who have lost all their documents are cleaned up
+        try:
+            await self._cache_client.do_delete_pattern("%s:*" % KEY_FILTER_OPTIONS)
+        except Exception as exc:
+            self.logging.warning("Failed to clear filter cache before full rebuild: %s", exc)
+
+        by_engine_owner: dict[tuple[str, int], dict] = {}
+        for doc in enriched_docs:
+            if not doc.owner_id:
+                continue
+            key = (doc.engine, doc.owner_id)
+            if key not in by_engine_owner:
+                by_engine_owner[key] = {
+                    "correspondents": set(),
+                    "document_types": set(),
+                    "tags": set(),
+                }
+            if doc.correspondent and doc.correspondent.name:
+                by_engine_owner[key]["correspondents"].add(doc.correspondent.name)
+            if doc.document_type and doc.document_type.name:
+                by_engine_owner[key]["document_types"].add(doc.document_type.name)
+            for tag in (doc.tags or []):
+                if tag.name:
+                    by_engine_owner[key]["tags"].add(tag.name)
+
+        for (engine_name, oid), opts in by_engine_owner.items():
+            options = {
+                "correspondents": sorted(opts["correspondents"]),
+                "document_types": sorted(opts["document_types"]),
+                "tags": sorted(opts["tags"]),
+            }
+            try:
+                cache_key = "%s:%s:%d" % (KEY_FILTER_OPTIONS, engine_name, oid)
+                await self._cache_client.do_set_json(cache_key, options)
+                self.logging.debug(
+                    "Filter cache updated for engine=%s, owner_id=%d: %d correspondents, "
+                    "%d document_types, %d tags.",
+                    engine_name, oid,
+                    len(options["correspondents"]),
+                    len(options["document_types"]),
+                    len(options["tags"]),
+                )
+            except Exception as exc:
+                self.logging.warning(
+                    "Failed to write filter cache for engine=%s, owner_id=%d: %s",
+                    engine_name, oid, exc,
+                )

@@ -1,6 +1,6 @@
 """Sync runner entry point.
 
-Mirrors Paperless-ngx OCR text into Qdrant for semantic search.
+Mirrors DMS text into RAG for semantic search.
 Run directly for a one-shot full sync, or invoke do_incremental_sync()
 from the webhook handler for event-driven updates.
 
@@ -10,6 +10,8 @@ Usage:
 
 import asyncio
 
+from shared.clients.cache.CacheClientInterface import CacheClientInterface
+from shared.clients.cache.CacheClientManager import CacheClientManager
 from shared.clients.dms.DMSClientManager import DMSClientManager
 from shared.clients.rag.RAGClientManager import RAGClientManager
 from shared.clients.rag.RAGClientInterface import RAGClientInterface
@@ -28,18 +30,32 @@ async def main() -> None:
     dmsManager = DMSClientManager(helper_config=config)
     ragManager = RAGClientManager(helper_config=config)
     embedManager = LLMClientManager(helper_config=config)
+    cacheManager = CacheClientManager(helper_config=config)
 
     # init clients
     dms_clients = dmsManager.get_clients()
     rag_clients = ragManager.get_clients()
     embed_client = embedManager.get_client()
+    cache_client = cacheManager.get_client()
 
     try:
         booted_dms_clients: list[DMSClientInterface] = []
         booted_rag_clients: list[RAGClientInterface] = []
         booted_embed_client: LLMClientInterface | None = None
+        booted_cache_client: CacheClientInterface | None = None
 
         # boot all clients
+        ## cache client is required, if it fails to boot, we cannot continue, because it would massively degrade performance and put a lot of load on the rag and dms clients. So we abort the whole process if cache client fails.
+        
+        logging.info("Booting all clients...")
+        try:
+            await cache_client.boot()
+            await cache_client.do_healthcheck()
+            booted_cache_client = cache_client
+        except Exception as e:
+            logger.error(f"Error booting Cache client {cache_client.get_engine_name()}: {e}. Aborting.")
+            return
+
         ## embed client is required, if it fails to boot, we cannot continue, as there is no point in syncing without embedding. So we abort the whole process if embed client fails.
         try:
             await embed_client.boot()
@@ -73,6 +89,7 @@ async def main() -> None:
         if not booted_rag_clients:
             logger.error("No RAG clients booted successfully. Aborting.")
             return
+        logging.info("All clients booted successfully.", color="green")
 
         # create all rag collections, if not already existing
         for rag_client in booted_rag_clients:
@@ -84,7 +101,8 @@ async def main() -> None:
             helper_config=config,
             dms_clients=booted_dms_clients,
             rag_clients=booted_rag_clients,
-            embed_client=booted_embed_client
+            embed_client=booted_embed_client,
+            cache_client=booted_cache_client,
         )
         await sync_service.do_full_sync()
     finally:
@@ -94,6 +112,8 @@ async def main() -> None:
             await dms_client.close()
         for rag_client in rag_clients:
             await rag_client.close()
+        if cache_client:
+            await cache_client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
