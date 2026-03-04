@@ -19,7 +19,11 @@
       "Bash(python:*)",
       "WebSearch",
       "WebFetch(domain:ollama.com)",
-      "WebFetch(domain:www.autodidacts.io)"
+      "WebFetch(domain:www.autodidacts.io)",
+      "WebFetch(domain:www.reddit.com)",
+      "WebFetch(domain:getomni.ai)",
+      "WebFetch(domain:modal.com)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

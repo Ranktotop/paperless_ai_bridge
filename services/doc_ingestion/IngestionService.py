@@ -1,15 +1,14 @@
 """Core orchestrator for the document ingestion pipeline."""
 import hashlib
-import os
+from dataclasses import dataclass
 
 from shared.clients.cache.CacheClientInterface import CacheClientInterface, KEY_INGESTION_FILE
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.models.DocumentUpdate import DocumentUpdateRequest
 from shared.clients.llm.LLMClientInterface import LLMClientInterface
 from shared.helper.HelperConfig import HelperConfig
-from services.doc_ingestion.helper.Document import Document, DocumentValidationError
+from services.doc_ingestion.helper.Document import Document, DocumentValidationError, DocumentPathValidationError
 from shared.helper.HelperFile import HelperFile
-
 
 class IngestionService:
     """Orchestrates the file ingestion pipeline:
@@ -35,7 +34,7 @@ class IngestionService:
         self._helper_file = HelperFile()
 
     ##########################################
-    ############### CORE #####################
+    ############# INGESTION ##################
     ##########################################
 
     async def do_ingest_file(self, file_path: str, root_path: str) -> int | None:
@@ -72,9 +71,6 @@ class IngestionService:
         
         self.logging.info("Ingesting file '%s'...", file_path)
 
-        #load dms cache first
-        await self._dms_client.fill_cache()
-
         # Load the file as document
         theDocument = Document(
             root_path=root_path,
@@ -83,91 +79,260 @@ class IngestionService:
             helper_config=self._config,
             llm_client=self._llm_client,
             dms_client=self._dms_client,
-            path_template=self._template
+            path_template=self._template,
+            file_bytes=file_bytes,
+            file_hash=file_hash
         )
-        # Boot up the document (fetches text of the file)
+        # Boot up the document
         try:
             await theDocument.boot()
-        except DocumentValidationError as e:
-            self.logging.warning("Skipping '%s': %s", file_path, e, color="yellow")
+        except DocumentPathValidationError as e:
+            self.logging.warning("Skipping: '%s': %s", file_path, e, color="yellow")
             return None
         except Exception as e:
             self.logging.error("Failed to boot document '%s': %s", file_path, e)
             return None
         
-        # Ingest the document into the DMS. Cleanup afterwards to remove temp files.
+        # Load the content
         try:
-            # Get the required data
-            meta = theDocument.get_metadata()
-            tags = theDocument.get_tags()
-            title = theDocument.get_title()
-            content = theDocument.get_content()
-            date_string = theDocument.get_date_string(pattern="%Y-%m-%d") # e.g. "2024-06-30"
-
-            # Resolve/create DMS entities
-            correspondent_id: int | None = None
-            document_type_id: int | None = None
-            tag_ids: list[int] = []
-
-            if meta.correspondent:
-                try:
-                    correspondent_id = await self._dms_client.do_resolve_or_create_correspondent(meta.correspondent)
-                except Exception as exc:
-                    self.logging.warning("Failed to resolve correspondent '%s': %s", meta.correspondent, exc)
-
-            if meta.document_type:
-                try:
-                    document_type_id = await self._dms_client.do_resolve_or_create_document_type(meta.document_type)
-                except Exception as exc:
-                    self.logging.warning("Failed to resolve document_type '%s': %s", meta.document_type, exc)
-
-            for tag_name in tags:
-                try:
-                    tag_id = await self._dms_client.do_resolve_or_create_tag(tag_name)
-                    tag_ids.append(tag_id)
-                except Exception as exc:
-                    self.logging.warning("Failed to resolve tag '%s': %s", tag_name, exc)
-
-            # Upload original file to dms (file_bytes already read above for hash check)
-            try:
-                doc_id = await self._dms_client.do_upload_document(
-                    file_bytes=file_bytes,
-                    file_name=os.path.basename(file_path),
-                    owner_id=self._default_owner_id,
-                )
-            except FileExistsError:
-                self.logging.warning("Skipping '%s': already exists in DMS.", file_path)
-                return None
-            except Exception as exc:
-                self.logging.error("Upload failed for '%s': %s", file_path, exc)
-                return None
-
-            # Store hash after confirmed upload so the file is skipped on future runs
-            await self._cache_client.do_set(cache_key, str(doc_id))
-
-            # Upsert the DMS Document with the extracted metadata
-            try:
-                await self._dms_client.do_update_document(
-                    document_id=doc_id,
-                    update=DocumentUpdateRequest(
-                        title=title,
-                        correspondent_id=correspondent_id,
-                        document_type_id=document_type_id,
-                        tag_ids=tag_ids,
-                        content=content,
-                        created_date=date_string,
-                        owner_id=self._default_owner_id,
-                    ),
-                )
-            except Exception as exc:
-                self.logging.error(
-                    "Metadata update failed for document id=%d ('%s'): %s",
-                    doc_id, file_path, exc,
-                )
-
-            self.logging.info(
-                "File '%s' ingested successfully -> DMS document id=%d", file_path, doc_id
-            )
-            return doc_id
+            await theDocument.load_content()
+        except Exception as e:
+            self.logging.error("Failed to load content for document '%s': %s", file_path, e)
+            return None
+        
+        # Format the content
+        try:
+            await theDocument.format_content()
+        except Exception as e:
+            self.logging.error("Failed to format content for document '%s': %s", file_path, e)
+            return None
+        
+        # Load the metadata
+        try:
+            await theDocument.load_metadata()
+        except Exception as e:
+            self.logging.error("Failed to load metadata for document '%s': %s", file_path, e)
+            return None
+        
+        # Load the tags
+        try:
+            await theDocument.load_tags()
+        except Exception as e:
+            self.logging.error("Failed to load tags for document '%s': %s", file_path, e)
+            return None
+        
+        # Upload to DMS
+        try:
+            await self._push_document(theDocument, cache_key)
         finally:
             theDocument.cleanup()
+
+    async def do_ingest_files_batch(self, file_paths: list[str], root_path: str, batch_size: int = 0) -> None:
+        """Ingest multiple files using a phased batch approach.
+
+        Processes files in sub-batches so each LLM model stays loaded for the
+        full sub-batch before being swapped out:
+
+          Phase 1 — Vision LLM: ``boot_extract()`` for every file.
+          Phase 2 — Chat LLM:   ``boot_chat()``    for every extracted file.
+          Phase 3 — Upload:     DMS upload + metadata update for every analysed file.
+
+        Args:
+            file_paths: Ordered list of absolute file paths to ingest.
+            root_path:  Root scan directory (used for relative path calculation).
+            batch_size: Maximum files per sub-batch.  ``0`` means no limit
+                        (all files processed in a single batch).
+        """
+        if not file_paths:
+            return
+        # split files into batches
+        document_batches = (
+            [file_paths[i:i + batch_size] for i in range(0, len(file_paths), batch_size)]
+            if batch_size > 0
+            else [file_paths]
+        )
+        for batch in document_batches:
+            await self._ingest_batch(batch, root_path)
+
+    async def _ingest_batch(self, file_paths: list[str], root_path: str) -> None:
+        """Run one complete three-phase batch for the given file paths."""
+
+        # boot each document if not already in cache. If boot fails ignore the document
+        booted_docs: list[Document] = []
+
+        for file_path in file_paths:            
+            # check file hash cache — skip immediately if already ingested
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            cache_key = "%s:%s" % (KEY_INGESTION_FILE, file_hash)
+            cached_doc_id = await self._cache_client.do_get(cache_key)
+            if cached_doc_id is not None:
+                self.logging.info("Skipping '%s': already ingested (doc_id=%s).", file_path, cached_doc_id, color="blue")
+                continue
+
+            # init the document
+            doc = Document(
+                root_path=root_path,
+                source_file=file_path,
+                working_directory=self._helper_file.generate_tempfolder(path_only=True),
+                helper_config=self._config,
+                llm_client=self._llm_client,
+                dms_client=self._dms_client,
+                path_template=self._template,
+                file_bytes=file_bytes,
+                file_hash=file_hash
+            )
+            # boot the document
+            try:
+                doc.boot()
+                booted_docs.append(doc)
+            except DocumentPathValidationError as e:
+                self.logging.warning("Skipping '%s': %s", file_path, e, color="yellow")
+            except DocumentValidationError as e:
+                self.logging.error("Skipping '%s': %s", file_path, e, color="red")
+            except Exception as e:
+                self.logging.error("Failed to boot document '%s': %s", file_path, e)
+        
+        # Phase 1: load the content for all files
+        docs_with_content: list[Document] = []
+        for doc in booted_docs:
+            try:
+                await doc.load_content()
+                docs_with_content.append(doc)
+            except Exception as e:
+                self.logging.error("Failed to load content for document '%s': %s", doc.get_source_file(True), e)
+                doc.cleanup()
+
+        # Phase 2: Format the content if needed
+        formatted_docs: list[Document] = []
+        for doc in docs_with_content:
+            try:
+                await doc.format_content()
+                formatted_docs.append(doc)
+            except Exception as e:
+                self.logging.error("Failed to format content for document '%s': %s", doc.get_source_file(True), e)
+                doc.cleanup()
+
+        # Phase 3: Load the meta
+        meta_docs: list[Document] = []
+        for doc in formatted_docs:
+            try:
+                await doc.load_metadata()
+                meta_docs.append(doc)
+            except Exception as e:
+                self.logging.error("Failed to load metadata for document '%s': %s", doc.get_source_file(True), e)
+                doc.cleanup()
+
+        # Phase 4: Collect the tags
+        tagged_docs: list[Document] = []
+        for doc in meta_docs:
+            try:
+                await doc.load_tags()
+                tagged_docs.append(doc)
+            except Exception as e:
+                self.logging.error("Failed to load tags for document '%s': %s", doc.get_source_file(True), e)
+                doc.cleanup()
+
+        # Phase 5: Upload to DMS
+        for doc in tagged_docs:
+            try:
+                await self._push_document(doc, "%s:%s" % (KEY_INGESTION_FILE, doc.get_file_hash()))
+            finally:
+                doc.cleanup()
+
+    ##########################################
+    ################# DMS ####################
+    ##########################################
+
+    async def _push_document(self, document: Document, cache_key: str) -> int | None:
+        """
+        Pushes a fully booted and analysed Document through the final upload and metadata update steps.
+
+        Args:
+            document: A Document instance that has completed all boot and analysis phases.
+            cache_key: The cache key corresponding to this document's file hash, used for caching the DMS document ID.        
+        """
+        # Get the required data
+        file_name = document.get_source_file(filename_only=True)
+        file_path = document.get_source_file()
+        file_bytes = document.get_file_bytes()
+        meta = document.get_metadata()
+        tags = document.get_tags()
+        title = document.get_title()
+        content = document.get_content()
+        date_string = document.get_date_string(pattern="%Y-%m-%d") # e.g. "2024-06-30"
+
+        # Resolve/create DMS entities
+        correspondent_id: int | None = None
+        document_type_id: int | None = None
+        tag_ids: list[int] = []
+
+        if meta.correspondent:
+            try:
+                correspondent_id = await self._dms_client.do_resolve_or_create_correspondent(meta.correspondent)
+            except Exception as e:
+                self.logging.warning("Failed to resolve correspondent '%s': %s", meta.correspondent, e)
+
+        if meta.document_type:
+            try:
+                document_type_id = await self._dms_client.do_resolve_or_create_document_type(meta.document_type)
+            except Exception as e:
+                self.logging.warning("Failed to resolve document_type '%s': %s", meta.document_type, e)
+
+        for tag_name in tags:
+            try:
+                tag_id = await self._dms_client.do_resolve_or_create_tag(tag_name)
+                tag_ids.append(tag_id)
+            except Exception as e:
+                self.logging.warning("Failed to resolve tag '%s': %s", tag_name, e)
+
+        # Upload original file to dms (file_bytes already read above for hash check)
+        try:
+            doc_id = await self._dms_client.do_upload_document(
+                file_bytes=file_bytes,
+                file_name=file_name,
+                owner_id=self._default_owner_id,
+            )
+        except FileExistsError as e:
+            dup_id: int | None = e.args[0] if e.args else None
+            if dup_id is not None:
+                self.logging.warning(
+                    "Skipping '%s': duplicate of DMS doc id=%d. Caching hash.",
+                    file_path, dup_id, color="yellow",
+                )
+                await self._cache_client.do_set(cache_key, str(dup_id))
+            else:
+                self.logging.warning("Skipping '%s': already exists in DMS.", file_path)
+            return None
+        except Exception as e:
+            self.logging.error("Upload failed for '%s': %s", file_path, e)
+            return None
+
+        # Store hash after confirmed upload so the file is skipped on future runs
+        await self._cache_client.do_set(cache_key, str(doc_id))
+
+        # Upsert the DMS Document with the extracted metadata
+        try:
+            await self._dms_client.do_update_document(
+                document_id=doc_id,
+                update=DocumentUpdateRequest(
+                    title=title,
+                    correspondent_id=correspondent_id,
+                    document_type_id=document_type_id,
+                    tag_ids=tag_ids,
+                    content=content,
+                    created_date=date_string,
+                    owner_id=self._default_owner_id,
+                ),
+            )
+        except Exception as e:
+            self.logging.error(
+                "Metadata update failed for document id=%d ('%s'): %s",
+                doc_id, file_path, e,
+            )
+
+        self.logging.info(
+            "File '%s' ingested successfully -> DMS document id=%d", file_path, doc_id
+        )
+        return doc_id

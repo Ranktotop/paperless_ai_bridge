@@ -250,10 +250,17 @@ class DMSClientPaperless(DMSClientInterface):
             if status == "FAILURE":
                 result_msg = task.get("result", "unknown error")
                 if "duplicate" in result_msg.lower():
-                    raise FileExistsError(
-                        "Paperless-ngx task %s: duplicate document '%s': %s"
-                        % (task_uuid, file_name, result_msg)
-                    )
+                    # Try related_document field first (Paperless >= ~1.17),
+                    # fall back to parsing the ID from the result string.
+                    dup_id: int | None = None
+                    if related_document:
+                        dup_id = int(related_document)
+                    else:
+                        import re
+                        m = re.search(r"\(#(\d+)\)", result_msg)
+                        if m:
+                            dup_id = int(m.group(1))
+                    raise FileExistsError(dup_id)
                 raise RuntimeError(
                     "Paperless-ngx task %s failed for '%s': %s"
                     % (task_uuid, file_name, result_msg)

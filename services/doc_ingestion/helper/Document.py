@@ -5,19 +5,24 @@ from shared.clients.dms.DMSClientInterface import DMSClientInterface
 import os
 from uuid import uuid4
 from shared.helper.HelperFile import HelperFile
+from collections import Counter
 import fitz # PyMuPDF
 import base64
 import re
 import json
 from dataclasses import dataclass
+import hashlib
 
 class DocumentValidationError(Exception):
-    """Raised when a document cannot be ingested due to a known, expected condition.
-
-    Examples: missing correspondent in path, unsupported file format.
+    """
+    Raised when a document cannot be ingested due to a known, expected condition.
+    """
+class DocumentPathValidationError(Exception):
+    """
+    Raised when the path of an document does not fit the minimum requirements for metadata extraction, e.g. missing correspondent.
+    
     Callers should log this as WARNING, not ERROR.
     """
-
 
 @dataclass
 class DocMetadata:
@@ -61,7 +66,9 @@ class Document():
                  helper_config: HelperConfig,
                  llm_client: LLMClientInterface,
                  dms_client: DMSClientInterface,
-                 path_template: str | None = None) -> None:
+                 path_template: str | None = None,
+                 file_bytes: bytes = None,
+                 file_hash: str | None = None) -> None:
         """Initialise the document without performing any I/O.
 
         Args:
@@ -78,99 +85,238 @@ class Document():
             path_template: Path template string with ``{correspondent}``,
                 ``{document_type}``, ``{year}``, ``{month}``, ``{day}``,
                 ``{title}`` placeholders.  Defaults to ``{filename}``.
+            file_bytes: Optional file content as bytes. If not passed it will be read automatically
+            file_hash: Optional precomputed hash of the file content. If not passed it will be computed automatically during boot.
         """
-        self._root_path = root_path
-        self._path_template = path_template or self._get_default_path_template()
-        self._source_file = source_file
-        self._config = helper_config
+        # general 
         self.logging = helper_config.get_logger()
+        self._language = helper_config.get_string_val("LANGUAGE", "German")
+
+        # settings
+        self._skip_direct_read = helper_config.get_bool_val("DOC_INGESTION_SKIP_DIRECT_READ", False)
+        self._skip_ocr_read = helper_config.get_bool_val("DOC_INGESTION_SKIP_OCR_READ", False)
+        self._minimum_text_chars_for_direct_read = helper_config.get_number_val("DOC_INGESTION_MINIMUM_TEXT_CHARS_FOR_DIRECT_READ", 40)
+        self._page_dpi = helper_config.get_number_val("DOC_INGESTION_PAGE_DPI", 150)
+        self._vision_context_chars = helper_config.get_number_val("DOC_INGESTION_VISION_CONTEXT_CHARS", 300)
+
+        # files and paths 
+        self._root_path = root_path
+        self._source_file = source_file        
+        self._path_template = path_template or "{filename}"
         self._working_directory = os.path.join(working_directory, str(uuid4().hex[:8]))
+        if not file_bytes:
+            with open(source_file, "rb") as f:
+                self._file_bytes = f.read()
+        else:
+            self._file_bytes = file_bytes
+
+        if not file_hash:
+            self._file_hash = hashlib.sha256(self._file_bytes).hexdigest()
+        else:
+            self._file_hash = file_hash
+
+        # helper
+        self._helper_config = helper_config
         self._helper_file = HelperFile()
+
+        # clients
         self._llm_client = llm_client
         self._dms_client = dms_client
-        self._language = self._config.get_string_val("LANGUAGE", "German")
-        self._converter: DocumentConverter | None = None  
-        self._converted_file:str | None = None 
-        self._extension:str | None = None
-        self._filename:str | None = None
-        self._metadata:DocMetadata|None = None
-        self._tags:list[str]|None = None
 
-        #settings
-        self._skip_direct_read = self._config.get_bool_val("DOC_INGESTION_SKIP_DIRECT_READ", False)
-        self._skip_ocr_read = self._config.get_bool_val("DOC_INGESTION_SKIP_OCR_READ", False)
-        self._minimum_text_chars_for_direct_read = self._config.get_number_val("DOC_INGESTION_MINIMUM_TEXT_CHARS_FOR_DIRECT_READ", 40)
+        # bootable
+        ## helper
+        self._converter: DocumentConverter | None = None  
+
+        ## file
+        self._converted_file:str | None = None 
+        self._source_filename:str | None = None
+        self._converted_extension:str | None = None
+
+        ## content
+        self._content_needs_formatting: bool|None = None
+        self._page_contents: list[str] | None = None
+        self._final_content: str | None = None
+        
+        ## metadata
+        self._metadata_path:DocMetadata|None = None
+        self._metadata_final:DocMetadata|None = None
+        self._tags:list[str]|None = None
 
     ##########################################
     ############### CORE #####################
     ##########################################
 
-    async def boot(self) -> None:
-        """Prepare the document for data extraction.
+    def is_booted(self) -> bool:
+        """
+        Return True if the working directory exists and the converter is ready to use.
+        This is a sanity check to prevent starting the extraction process when the document is not properly initialized, which would lead to confusing errors later on.
 
-        Execution order:
-        1. Validate path template metadata (raises ``DocumentValidationError``
-           immediately if mandatory fields like ``correspondent`` are missing —
-           before any I/O or LLM call is made).
-        2. Create the UUID-named working directory.
-        3. Initialise ``DocumentConverter`` and convert the source file to a
-           supported format (native formats are copied; office formats are
-           converted to PDF via LibreOffice).
-        4. Extract raw text: direct read for ``txt``/``md``; PyMuPDF per-page
-           text with Vision LLM fallback for pages below the minimum-char
-           threshold for other formats.
-        5. Format the raw text as Markdown via the chat LLM.
-        6. Merge path-template metadata with LLM-extracted metadata.
-        7. Extract tags via the chat LLM.
+        Returns:
+            bool: True if the document is booted and ready for content extraction, False otherwise.
+        """
+        return self._helper_file.folder_exists(self._working_directory) and (self._converter is not None and self._converter.is_booted())
 
-        If any step after directory creation raises, the working directory is
-        removed before re-raising so no temporary files are left behind.
+    def boot(self) -> None:
+        """
+        Phase 1: 
+          - Validates the document path against the template
+          - Creates the working directory
+          - Converts the document to a processable format
 
         Raises:
-            DocumentValidationError: Path template validation failed (e.g.
-                missing ``correspondent``).
-            RuntimeError: Any other unrecoverable error during boot.
+            DocumentPathValidationError: If the document path does not match the template requirements (e.g. missing correspondent).
+            RuntimeError: If the working directory cannot be created, if required dependencies are missing, or if conversion fails.
         """
-        # Validate path metadata first — pure string/regex, no I/O.
-        # Raises immediately if mandatory fields (e.g. correspondent) are missing,
-        # before any temp directories are created or LLM calls are made.
-        self._read_meta_from_path()
+        # Gate, if the path template does not match, throw error
+        self._metadata_path = self._read_meta_from_path()
 
-        #create directory
+        #create the working dir
         if not self._helper_file.create_folder(self._working_directory):
-            raise RuntimeError(f"Failed to create working directory for Document in '{self._working_directory}'")
+            raise RuntimeError("Failed to create working directory for Document in '%s'" % self._working_directory)
         
-        #use try for making sure we clean up if anything goes wrong during boot, to avoid leaving temp files around
+        #wrap in try to cleanup on any error during boot
         try:
-            #make sure we have access to Vision LLM if needed
+            #check required dependencies
             if not self._llm_client.get_vision_model():
-                raise RuntimeError("Document: LLM_MODEL_VISION not configured, cannot process documents that require OCR")
+                raise RuntimeError("Document: LLM_MODEL_VISION not configured, cannot process documents")
             
-            #init converter
+            #load converter
             self._converter = DocumentConverter(
-                helper_config=self._config,
+                helper_config=self._helper_config,
                 working_directory=os.path.join(self._working_directory, "conversions")
             )
             self.logging.debug("Document converter initialized for file '%s'", self._source_file, color="green")
-                    
-            #convert the file to supported format
+
+            #convert to processable format
             self._converted_file = self._converter.convert(self._source_file)
             self._extension = self._helper_file.get_file_extension(self._converted_file, True, True)
             self._filename = self._helper_file.get_basename(self._source_file, True)
             self.logging.debug("Document now in supported format: '%s'", self._converted_file, color="green")
-
-            #read the content and metadata of the file
-            raw_text = await self._extract_text()
-            self._content = await self._format_content(raw_text)
-            self._metadata = await self._read_metadata()
-            self._tags = await self._read_tags_from_content()
         except Exception as e:
-            self._helper_file.remove_folder(self._working_directory)
+            self.cleanup()
             raise e
+
+    async def load_content(self) -> None:
+        """
+        Loads the content by either reading directly or using the vision LLM.
+
+        Raises:
+            RuntimeError: If the document is not booted, or if content extraction fails/returned no content.
+        """
+        if not self.is_booted():
+            raise RuntimeError("Document: cannot extract text, document not booted")
         
+        #if we cann access the content directly
+        if self._extension in self._get_direct_read_file_formats():
+            text = self._helper_file.read_text_file(self._converted_file)
+            if text is None or not text.strip():
+                raise RuntimeError("Error reading text directly from file '%s'" % self._converted_file)
+            #save the content
+            self._page_contents = [text]
+            self._content_needs_formatting = False
+            self.logging.info("Read text directly from '%s'", self._filename, color="green")
+            self.logging.debug(self._page_contents, color="blue")
+
+        # if vision llm is deactivated, simply try to read the file programmatically
+        elif self._skip_ocr_read:
+            self._page_contents = self._read_file_programatically() # already logs the content
+            self._content_needs_formatting = True
+        # if vision llm is activated, we use llm ocr to read the content
+        else:
+            self._page_contents = await self._read_file_vision() # already logs the content
+            self._content_needs_formatting = True
+
+        #if we got no content, we raise an error
+        if not self._page_contents:
+            raise RuntimeError("No content extracted from document '%s'" % self._converted_file)
+
+    async def format_content(self) -> None:
+        """Phase 2: merge pages (if needed), extract metadata and tags via Chat LLM.
+
+        Must be called after a successful ``boot_extract``.  If ``boot_extract``
+        produced raw pages (PDF + Vision path), merges them into the final
+        Markdown content first.  Then extracts metadata and tags.
+
+        Raises:
+            RuntimeError: If content is not available or an LLM call fails.
+        """
+        # check if content was already extracted
+        if not self._page_contents:
+            raise RuntimeError("Document: cannot format content, no page contents available")
+        
+        #check if format is needed
+        if not self._content_needs_formatting:
+            self._final_content = "\n\n".join(self._page_contents)
+            return
+        
+        #format each page
+        minimum_text_chars = 10
+        formatted_pages: list[str] = []
+        for idx, page in enumerate(self._page_contents):
+            formatted = await self._call_chat_llm_format(page)
+            
+            #make sure there is some text on the page
+            if len(formatted) >= minimum_text_chars:
+                formatted_pages.append(formatted)
+                self.logging.info(f"Formatted text page {idx + 1} by Chat LLM from file '{self._filename}'", color="green")
+                self.logging.debug(formatted, color="blue")
+                continue
+            else:
+                raise RuntimeError(f"Formatted content from Chat LLM is too short or empty for page {idx + 1} of file '{self._filename}'")
+            
+        #merge the pages into the final content
+        formatted_pages = self._remove_repeated_headers_footers(formatted_pages)
+        formatted_pages = self._stitch_table_continuations(formatted_pages)
+        self._final_content = await self._call_chat_llm_merge(formatted_pages)
+        if not self._final_content.strip():
+            self._final_content = None
+            raise RuntimeError(f"Final merged content from Chat LLM is empty for file '{self._filename}'")
+        
+    async def load_metadata(self) -> None:
+        """Phase 3: Fetch metadata from path and enrich them by using LLM on final_content
+
+        Raises:
+            RuntimeError: If content is not available or an LLM call fails.
+        """
+        # check if content was already extracted
+        if not self._final_content:
+            raise RuntimeError("Document: cannot extract metadata, no final content available")
+        
+        # check if path meta is available
+        if not self._metadata_path:
+            raise RuntimeError("Document: cannot extract metadata, no path metadata available. Did you ran boot()?")
+            
+        # fill up using llm
+        llm_meta = await self._call_chat_llm_meta()
+        
+        # merge path meta with llm meta
+        content_meta = DocMetadata(
+            correspondent=self._metadata_path.correspondent or llm_meta.correspondent,
+            document_type=self._metadata_path.document_type or llm_meta.document_type,
+            year=self._metadata_path.year or llm_meta.year,
+            month=self._metadata_path.month or llm_meta.month,
+            day=self._metadata_path.day or llm_meta.day,
+            title=self._metadata_path.title or llm_meta.title,
+            filename=self._helper_file.get_basename(self._source_file, True)
+        )     
+
+        # make sure each field of DocMetadata is filled
+        for field_name in content_meta.__dataclass_fields__.keys():
+            if not getattr(content_meta, field_name):
+                raise RuntimeError(f"Document: metadata field '{field_name}' is missing after LLM extraction for file '{self._filename}'")
+        self._metadata_final = content_meta
+
+    async def load_tags(self) -> None:
+        # check if content was already extracted
+        if not self._final_content:
+            raise RuntimeError("Document: cannot extract tags, no final content available")
+        # fetch tags. This throws error if no tags are found
+        tags = await self._call_chat_llm_tags()
+        self._tags = tags
 
     def cleanup(self) -> None:
-        """Remove the working directory and reset all extracted state.
+        """
+        Remove the working directory and reset all bootable vars.
 
         Must be called in a ``finally`` block after ``boot()`` to ensure
         temporary files are deleted even when ingestion fails.
@@ -179,37 +325,48 @@ class Document():
         #delete the working dir
         if not self._helper_file.remove_folder(self._working_directory):
             self.logging.warning(f"DocHelper: failed to delete working directory '{self._working_directory}' for converted files")
-        #reset state
-        self._converted_file = None
-        self._extension = None
-        self._filename = None
-        self._content = None
-        self._metadata = None
-        self._tags = None
+        # reset bootable
+        ## helper
+        self._converter: DocumentConverter | None = None  
 
-    def is_booted(self) -> bool:
-        """Return True if the working directory exists and the converter is ready."""
-        return self._helper_file.folder_exists(self._working_directory) and (self._converter is not None and self._converter.is_booted())
+        ## file
+        self._converted_file:str | None = None 
+        self._source_filename:str | None = None
+        self._converted_extension:str | None = None
+
+        ## content
+        self._content_needs_formatting: bool|None = None
+        self._page_contents: list[str] | None = None
+        self._final_content: str | None = None
+        
+        ## metadata
+        self._metadata_path:DocMetadata|None = None
+        self._metadata_final:DocMetadata|None = None
+        self._tags:list[str]|None = None
 
     ##########################################
     ############### GETTER ###################
     ##########################################
 
+    def get_source_file(self, filename_only: bool = False) -> str | None:
+        """Return the original source file path or just the filename."""
+        if not self.is_booted():
+            raise RuntimeError("Document: cannot get source file, document not booted")
+        if filename_only:
+            return self._source_filename
+        return self._source_file
+
     def _get_direct_read_file_formats(self) -> list[str]:
-        """Return a list of file extensions that can be read directly without OCR."""
+        """Return a list of file extensions that can be read directly without page iteration. E.g., 'txt', 'md'..."""
         return ["txt", "md"]
-    
-    def _get_default_path_template(self) -> str:
-        """Return the fallback path template used when none is configured."""
-        return "{filename}"
     
     def get_title(self) -> str:
         """Return the document title as '{correspondent} {document_type} {DD.MM.YYYY}'."""
-        return f"{self._metadata.correspondent} {self._metadata.document_type} {self._metadata.day}.{self._metadata.month}.{self._metadata.year}"
+        return f"{self._metadata_final.correspondent} {self._metadata_final.document_type} {self._metadata_final.day}.{self._metadata_final.month}.{self._metadata_final.year}"
 
     def get_metadata(self) -> DocMetadata:
         """Return the fully merged metadata (path template + LLM fill-in)."""
-        return self._metadata
+        return self._metadata_final
 
     def get_tags(self) -> list[str]:
         """Return the LLM-extracted tag list, or an empty list if none were found."""
@@ -217,78 +374,45 @@ class Document():
 
     def get_content(self) -> str:
         """Return the Markdown-formatted document content."""
-        return self._content
+        return self._final_content
     
     def get_date_string(self, pattern:str = "%Y-%m-%d") -> str|None:
         """Return the document creation date as a string in the given format, or None if not available."""
-        if not self._metadata.year:
+        if not self._metadata_final.year:
             return None
-        month = self._metadata.month or "01"
-        day = self._metadata.day or "01"
+        month = self._metadata_final.month or "01"
+        day = self._metadata_final.day or "01"
         try:
             from datetime import datetime
-            dt = datetime(int(self._metadata.year), int(month), int(day))
+            dt = datetime(int(self._metadata_final.year), int(month), int(day))
             return dt.strftime(pattern)
         except ValueError:
             return None
-
-    ##########################################
-    ############## CONTENT ###################
-    ##########################################
-
-    async def _extract_text(self) -> str:
-        """Extract raw plain text from the converted file.
-
-        Dispatches to direct read for plain-text formats (``txt``, ``md``) or
-        to the smart extractor (PyMuPDF + Vision LLM) for all other formats.
-
-        Returns:
-            Raw extracted text string.
-
-        Raises:
-            RuntimeError: If the document is not booted, or if extraction yields
-                an empty result.
-        """
-        if not self.is_booted():
-            raise RuntimeError("DocHelper: cannot extract text, document not booted")
-        # if we can read content directly, let's do it
-        if self._extension in self._get_direct_read_file_formats():
-            text = self._extract_text_directly()
-            if text is None or not text.strip():
-                raise RuntimeError(f"Error reading text directly from file '{self._converted_file}'")
-            self.logging.info(f"Extracted text directly from file '{self._filename}'", color="green")
-            self.logging.debug(text, color="blue")
-            return text
-        else:
-            # otherwise we need to use Vision LLM OCR
-            text = await self._extract_text_smart()
-            if text is None or not text.strip():
-                raise RuntimeError(f"Error extracting text from file '{self._converted_file}'")
-            return text
         
-    def _extract_text_directly(self) -> str|None:
-        """Try to extract text directly from the file without OCR."""
-        return self._helper_file.read_text_file(self._converted_file)
+    def get_file_bytes(self) -> bytes:
+        """Return the original file content as bytes."""
+        return self._file_bytes
     
-    async def _extract_text_smart(self) -> str|None:
-        """Extract text page-by-page using PyMuPDF with Vision LLM fallback.
+    def get_file_hash(self) -> str:
+        """Return the precomputed hash of the file content."""
+        return self._file_hash
 
-        For each page:
-        - If PyMuPDF can extract at least ``minimum_text_chars`` characters of
-          embedded text and ``DOC_INGESTION_SKIP_DIRECT_READ`` is False, that
-          text is used directly (fast, no API call).
-        - Otherwise the page is rendered as a PNG at ``page_dpi`` DPI and sent
-          to the Vision LLM for OCR (unless ``DOC_INGESTION_SKIP_OCR_READ`` is
-          True, in which case the page is silently skipped).
+    ##########################################
+    ########### CONTENT READER ###############
+    ##########################################
+
+    def _read_file_programatically(self) -> list[str]:
+        """
+        Uses PyMuPDF to extract text from each page
+        Ignores empty pages or pages with less minimum text chars.
 
         Returns:
-            All page texts joined by double newlines, or None on error.
+            List of extracted page texts.
         """
-        # if ocr is disabled, we reduce the minimum text chars for direct read to a very low number for not loosing all text
-        minimum_text_chars = self._minimum_text_chars_for_direct_read if not self._skip_ocr_read else 10
+        minimum_text_chars = 10 # ignore pages with less than this number of chars
         page_texts: list[str] = []
-        page_dpi = 96
         try:
+            # open the document
             doc = fitz.open(self._converted_file)
 
             #iterate pages
@@ -296,123 +420,331 @@ class Document():
                 direct_text = page.get_text().strip()
 
                 #make sure there is some text on the page
-                if not self._skip_direct_read and len(direct_text) >= minimum_text_chars:
+                if len(direct_text) >= minimum_text_chars:
                     page_texts.append(direct_text)
-                    self.logging.info(f"Extracted text page {page_num + 1} smart by reading directly from file '{self._filename}'", color="green")
+                    self.logging.info(f"Extracted text page {page_num + 1} programmatically from file '{self._filename}'", color="green")
                     self.logging.debug(direct_text, color="blue")
                     continue
+                else:
+                    self.logging.info(f"No text extracted programmatically from page {page_num + 1} of file '{self._filename}'", color="yellow")
+            doc.close()
+        except Exception as exc:
+            self.logging.error("Error extracting text programmatically from file '%s': %s", self._converted_file, exc)
+            return []
+        return page_texts
+    
+    async def _read_file_vision(self) -> list[str]:
+        """
+        Uses Vision-LLM to extract text from each page
+        Ignores empty pages or pages with less minimum text chars.
 
-                #if ocr is disabled, skip pages without enough direct text
-                if self._skip_ocr_read:
-                    continue
-
-                # Page has not enough text, fall back to Vision LLM OCR if possible
-                pix = page.get_pixmap(dpi=page_dpi)
-                #convert the page to png and to base64 for LLM input
+        Returns:
+            List of extracted page texts.
+        """
+        minimum_text_chars = 10 # ignore pages with less than this number of chars
+        page_texts: list[str] = []
+        try:
+            doc = fitz.open(self._converted_file)
+            for page_num, page in enumerate(doc):
+                #convert page to image as base64 for LLM input
+                pix = page.get_pixmap(dpi=self._page_dpi)
                 png_bytes = pix.tobytes("png")
                 b64 = base64.b64encode(png_bytes).decode("ascii")
 
-                #run the vision model on the created image
-                page_text = await self._call_vision_llm(b64)
-                if page_text:
-                    page_texts.append(page_text)
-                    self.logging.info(f"Extracted text page {page_num + 1} smart by using Vision LLM OCR for file '{self._filename}'", color="green")
-                    self.logging.debug(page_text, color="blue")
+                #add some context of the previous page for helping the model to understand if there is a continuation of a table or section
+                context_before = page_texts[-1][-self._vision_context_chars:] if page_texts else ""
+
+                #read the content using vision llm
+                text = await self._call_vision_llm(b64, context_before)
+
+                #make sure there is some text on the page
+                if len(text) >= minimum_text_chars:
+                    page_texts.append(text)
+                    self.logging.info(f"Extracted text page {page_num + 1} by vision LLM from file '{self._filename}'", color="green")
+                    self.logging.debug(text, color="blue")
+                    continue
+                else:
+                    self.logging.info(f"No text extracted by vision LLM from page {page_num + 1} of file '{self._filename}'", color="yellow")
             doc.close()
         except Exception as exc:
-            self.logging.error("Error extracting text from PDF '%s': %s", self._converted_file, exc)
-            return None
-        return "\n\n".join(page_texts)
+            self.logging.error("Error extracting text by vision LLM from file '%s': %s", self._converted_file, exc)
+            return []
+        return page_texts  
+    
+    ##########################################
+    ############ CONTENT FORMATTER ###########
+    ##########################################
+
+    def _remove_repeated_headers_footers(self, formatted_pages: list[str]) -> list[str]:
+        """
+        Checks if there are lines at the start or end of the pages which are repeated across most pages. E.g. a header with the document title, or a footer with page numbers. 
+        If such lines are found, they are stripped from the respective page boundaries to produce cleaner final content.
+
+        Args:
+            formatted_pages: Formatted text of each page as a list of strings.
+
+        Returns:
+            Cleaned pages with repeated boundary lines stripped.
+        """
+        if len(formatted_pages) < 2:
+            return formatted_pages
+
+        # count occurrences of each line in the first and last 3 lines of all pages
+        header_counts: Counter = Counter()
+        footer_counts: Counter = Counter()
+        for page in formatted_pages:
+            lines = [l for l in page.splitlines() if l.strip()]
+            for line in lines[:3]:
+                header_counts[line.strip()] += 1
+            for line in lines[-3:]:
+                footer_counts[line.strip()] += 1
+
+        # identify lines that appear in ≥ 60 % of pages as repeated headers/footers
+        threshold = max(2, len(formatted_pages) * 0.6)
+        repeated_headers = {line for line, count in header_counts.items() if count >= threshold}
+        repeated_footers = {line for line, count in footer_counts.items() if count >= threshold}
+
+        # if nothing to remove, return original pages
+        if not repeated_headers and not repeated_footers:
+            return formatted_pages
+
+        self.logging.debug(
+            "Removing repeated headers %s and footers %s for '%s'",
+            repeated_headers, repeated_footers, self._filename
+        )
+
+        # strip lines that match the repeated headers/footers from the start/end of each page
+        cleaned_pages: list[str] = []
+        for page in formatted_pages:
+            lines = page.splitlines()
+            while lines and lines[0].strip() in repeated_headers:
+                lines.pop(0)
+            while lines and lines[-1].strip() in repeated_footers:
+                lines.pop()
+            cleaned_pages.append("\n".join(lines).strip())
+        return cleaned_pages
+
+    def _stitch_table_continuations(self, formatted_pages: list[str]) -> list[str]:
+        """
+        Iterates all pages and check if the following page starts with a table while the current page ends with a table.
+        If so, we merge the two pages without adding a newline, so that tables that are split across pages are merged back together in the final content.
+
+        Args:
+            formatted_pages: Per-page Markdown strings (after header/footer cleanup).
+
+        Returns:
+            Pages list with cross-page tables merged into single entries.
+        """
+        # iterate all pages 
+        new_pages: list[str] = []
+        i = 0
+        while i < len(formatted_pages):
+            new_page = formatted_pages[i]
+            # if the current page ends with a table and the next page starts with a table...
+            while (
+                i + 1 < len(formatted_pages)
+                and self._page_ends_with_table(new_page)
+                and self._page_starts_with_table(formatted_pages[i + 1])
+            ):
+                i += 1
+                # merge the next page into the current one without adding a newline, so that tables split across pages are joined together
+                new_page = new_page.rstrip() + "\n" + formatted_pages[i].lstrip()
+                self.logging.debug(
+                    "Stitched cross-page table at boundary %d for '%s'", i, self._filename
+                )
+            # add the (possibly merged) current page to the result and move to the next one
+            new_pages.append(new_page)
+            i += 1
+        return new_pages
+
+    def _page_ends_with_table(self, page: str) -> bool:
+        """
+        Checks if the last non-empty line of the page starts with a pipe '|' and there are at least 2 pipe characters in that line.
+        This would be a strong indicator that it's part of a Markdown table.
+
+        Args:
+            page: The Markdown content of the page.
+
+        Returns:
+            True if the page likely ends with a table, False otherwise.
+        """
+        last = next((l for l in reversed(page.splitlines()) if l.strip()), "")
+        stripped = last.strip()
+        return stripped.startswith("|") and stripped.count("|") >= 2
+
+    def _page_starts_with_table(self, page: str) -> bool:
+        """
+        Checks if the first non-empty line of the page starts with a pipe '|' and there are at least 2 pipe characters in that line.
+        This would be a strong indicator that it's part of a Markdown table.
+
+        Args:
+            page: The Markdown content of the page.
+
+        Returns:
+            True if the page likely starts with a table, False otherwise.
+        """
+        first = next((l for l in page.splitlines() if l.strip()), "")
+        first = first.strip()
+        return first.startswith("|") and first.count("|") >= 2
 
     ##########################################
     ################# LLM ####################
     ##########################################
-    async def _call_vision_llm(self, png_b64_data: str) -> str|None:
+    
+    async def _call_vision_llm(self, png_b64_data: str, context_before: str) -> str:
         """
-        Send a base64-encoded image to the Vision LLM and return extracted text.
+        Send an image to the Vision LLM and return its content.
 
-        Uses the Ollama-native vision format: content is a plain string, images are
-        passed as a separate list of raw base64 strings (no data URI prefix).
+        Args:
+            png_b64_data: Base64-encoded PNG of the page.
+            context_before: Trailing text of the previously formatted page (may be empty).
+
+        Returns:
+            str: The text content extracted by the Vision LLM, or an empty string if the call fails.
         """
         messages = [
             {
                 "role": "user",
-                "content": (
-                    "Transcribe all text from this image exactly as it appears. "
-                    "Output plain text only — no markdown, no bullet points, no headers, "
-                    "no formatting symbols. Preserve line breaks."
-                ),
+                "content": self._get_prompt_vision_ocr(context=context_before),
                 "images": [png_b64_data],
             }
         ]
         try:
-            return await self._llm_client.do_chat_vision(messages=messages)
-        except Exception as exc:
-            self.logging.error("Vision LLM call failed for Document '%s': %s", self._converted_file, exc)
-            return None
+            result = await self._llm_client.do_chat_vision(messages=messages)
+            result = re.sub(r"```[a-zA-Z]*\s*\n?(.*?)\n?```", r"\1", result.strip(), flags=re.DOTALL)
+            return result.strip()
+        except Exception as e:
+            self.logging.error("Call Vision LLM %s failed for '%s': %s", self._llm_client.get_vision_model(), self._source_filename, e)
+            return ""    
 
-    async def _format_content(self, raw: str) -> str:
-        """Format raw extracted text as clean Markdown using the chat LLM.
-
-        Sends the raw text to the chat model with instructions to produce
-        Markdown with pipe tables, ``##`` headings, and ``**bold**`` for totals.
-        Any code fences the model wraps its output in are stripped.
-
-        Falls back to returning the unformatted ``raw`` text if the LLM call
-        fails, so ingestion can continue with plain-text content.
+    async def _call_chat_llm_format(self, raw: str) -> str:
+        """
+        Send raw text to the Chat LLM and return its formatted content.
 
         Args:
             raw: Plain text as returned by ``_extract_text()``.
 
         Returns:
-            Markdown-formatted content string, or ``raw`` on LLM failure.
+            str: The text content formatted by the Chat LLM, or an empty string if the call fails.
         """
-        prompt = (
-            "You are a document formatter. Format the following extracted document text as clean Markdown.\n\n"
-            "Rules:\n"
-            "- Preserve ALL text and values exactly — do not summarise or omit anything.\n"
-            "- Use ## for section headings.\n"
-            "- Use pipe tables for any tabular or structured key-value data.\n"
-            "- Use **bold** only for totals or key labels.\n"
-            "- Keep addresses, names, and flowing text as plain paragraphs.\n"
-            "- Output Markdown only — no explanations, no code fences.\n\n"
-            "Document text:\n"
-            + raw
-        )
+        prompt = self._get_prompt_format(unformatted_text=raw)
         messages = [{"role": "user", "content": prompt}]
         try:
             result = await self._llm_client.do_chat(messages)
             # Strip any code fences the model may wrap output in
             result = re.sub(r"```[a-zA-Z]*\s*\n?(.*?)\n?```", r"\1", result.strip(), flags=re.DOTALL)
-            return result.strip() or raw
-        except Exception as exc:
-            self.logging.warning("Content formatting failed for '%s', using raw text: %s", self._source_file, exc)
-            return raw
+            return result.strip()
+        except Exception as e:
+            self.logging.error("Call Chat LLM %s for formatting failed for '%s': %s", self._llm_client.get_chat_model(), self._source_filename, e)
+            return ""
+        
+    async def _call_chat_llm_merge(self, formatted_pages: list[str]) -> str:
+        """
+        Detect and join boundaries where content flows across pages.
+
+        Builds a compact overview of each page boundary (last 5 + first 5 non-empty
+        lines of adjacent pages) and asks the chat LLM which boundaries represent
+        a mid-flow break (unfinished sentence, continuing list item, etc.) rather
+        than a natural section end.  Only those boundaries are joined without a
+        blank-line separator; all others keep the standard paragraph gap.
+
+        Falls back to a plain ``\\n\\n`` join if the LLM call or JSON parse fails.
+
+        Args:
+            formatted_pages: Per-page Markdown strings (after programmatic cleanup).
+
+        Returns:
+            Final assembled Markdown document string.
+        """
+        #call llm for merging
+        prompt = self._get_prompt_merge(formatted_pages)
+        merge_boundaries: set[int] = set()
+        try:
+            raw = await self._llm_client.do_chat([{"role": "user", "content": prompt}])
+            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+            data = json.loads(raw)
+            merge_boundaries = set(int(b) for b in (data.get("merge_at_boundaries") or []))
+        except Exception as e:
+            self.logging.warning("Call Chat LLM %s for merging failed for '%s': %s.\nContinue joining pages as-is.", self._llm_client.get_chat_model(), self._source_filename, e, color="yellow")
+
+        # join the merged contents. If no boundaries to merge, this simply rejoins the original list with double newlines, preserving the original page breaks.
+        result_parts: list[str] = []
+        i = 0
+        while i < len(formatted_pages):
+            current = formatted_pages[i]
+            while i + 1 < len(formatted_pages) and i in merge_boundaries:
+                i += 1
+                current = current.rstrip() + "\n" + formatted_pages[i].lstrip()
+            result_parts.append(current)
+            i += 1
+        return "\n\n".join(result_parts).strip()   
+    
+    async def _call_chat_llm_meta(self) -> DocMetadata:
+        """Extract metadata from the formatted document content via the chat LLM.
+
+        Sends the first 3 000 characters of the formatted content together with
+        an extraction prompt and an optional hint containing existing DMS
+        document-type names.  Parses the JSON response into a ``DocMetadata``.
+
+        Returns:
+            ``DocMetadata`` with fields populated from the LLM response.
+
+        Raises:
+            RuntimeError: If the LLM call fails or the response cannot be
+                parsed as JSON.
+        """
+        #read the existing data from dms cache
+        prompt = self._get_prompt_extraction() + (self._get_prompt_cache() or "") + "\nDocument text:\n" + self._final_content[:3000]
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            # run the prompt
+            raw = await self._llm_client.do_chat(messages)
+            #parse the respone json
+            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+            data = json.loads(raw)
+            return DocMetadata(
+                correspondent=data.get("correspondent") or None,
+                document_type=data.get("document_type") or None,
+                year=data.get("year") or None,
+                month=data.get("month") or None,
+                day=data.get("day") or None,
+                title=data.get("title") or None,
+                filename=self._helper_file.get_basename(self._source_file, True))
+        except Exception as e:
+            raise RuntimeError(f"Failed to read meta from content using llm '{self._source_file}': {e}")    
+        
+    async def _call_chat_llm_tags(self) -> list[str]:
+        """
+        Extract tags from the formatted document content via the chat LLM.
+
+        Sends the first 3 000 characters of the formatted content together with
+        a tagging prompt that includes existing DMS tag names as hints.  The
+        model returns a JSON array of at most 3 tag name strings.
+
+        Returns:
+            list[str]: List of tag name strings (is never empty).
+
+        Raises:
+            RuntimeError: If the LLM call fails or the response is not a valid JSON array or empty.
+        """
+        prompt = self._get_prompt_tags() + self._final_content[:3000]
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            raw = await self._llm_client.do_chat(messages)
+            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+            data = json.loads(raw)
+            if isinstance(data, list):
+                #if empty throw error
+                if not data:
+                    raise ValueError(f"Tag extraction LLM response is an empty list for file '{self._source_file}'")
+                return [str(t) for t in data if t]
+            raise ValueError(f"Tag extraction LLM response is not a list for file '{self._source_file}': {raw}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read tags from content using llm '{self._source_file}': {e}")    
 
     ##########################################
     ################# META ###################
     ##########################################
-    async def _read_metadata(self) -> DocMetadata:
-        """Build the final ``DocMetadata`` by merging path and LLM sources.
-
-        Path template fields take precedence; the LLM fills any fields that
-        path parsing could not determine.
-        """
-        #read from path primary
-        path_meta = self._read_meta_from_path()        
-        #fill up using llm
-        llm_meta = await self._read_meta_from_content()
-        #merge both
-        return DocMetadata(
-            correspondent=path_meta.correspondent or llm_meta.correspondent,
-            document_type=path_meta.document_type or llm_meta.document_type,
-            year=path_meta.year or llm_meta.year,
-            month=path_meta.month or llm_meta.month,
-            day=path_meta.day or llm_meta.day,
-            title=path_meta.title or llm_meta.title,
-            filename=self._helper_file.get_basename(self._source_file, True)
-        )
-
     def _read_meta_from_path(self) -> DocMetadata:
         """Parse metadata from the file path using the configured path template.
 
@@ -426,7 +758,7 @@ class Document():
             ``DocMetadata`` populated from the path.
 
         Raises:
-            DocumentValidationError: If ``correspondent`` cannot be resolved
+            DocumentPathValidationError: If ``correspondent`` cannot be resolved
                 from the path (it is the only mandatory field).
         """
         known_vars = frozenset({
@@ -453,7 +785,7 @@ class Document():
             if var in known_vars and self._validate_segment_from_path_meta(var, value):
                 setattr(path_meta, var, value)
         if not path_meta.correspondent:
-            raise DocumentValidationError(
+            raise DocumentPathValidationError(
                 "Document: correspondent is required in path metadata but not found for file '%s' with template '%s'"
                 % (self._source_file, self._path_template)
             )
@@ -468,71 +800,7 @@ class Document():
         }
         if var in numeric_validators:
             return bool(numeric_validators[var].match(value))
-        return bool(value.strip())
-    
-    async def _read_meta_from_content(self) -> DocMetadata:
-        """Extract metadata from the formatted document content via the chat LLM.
-
-        Sends the first 3 000 characters of the formatted content together with
-        an extraction prompt and an optional hint containing existing DMS
-        document-type names.  Parses the JSON response into a ``DocMetadata``.
-
-        Returns:
-            ``DocMetadata`` with fields populated from the LLM response.
-
-        Raises:
-            RuntimeError: If the LLM call fails or the response cannot be
-                parsed as JSON.
-        """
-        #read the existing data from dms cache
-        prompt = self._get_prompt_extraction() + (self._get_prompt_cache() or "") + "\nDocument text:\n" + self._content[:3000]
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            # run the prompt
-            raw = await self._llm_client.do_chat(messages)
-            #parse the respone json
-            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
-            data = json.loads(raw)
-            return DocMetadata(
-                correspondent=data.get("correspondent") or None,
-                document_type=data.get("document_type") or None,
-                year=data.get("year") or None,
-                month=data.get("month") or None,
-                day=data.get("day") or None,
-                title=data.get("title") or None,
-                filename=self._helper_file.get_basename(self._source_file, True))
-        except Exception as exc:
-            raise RuntimeError(f"Failed to read meta from content using llm '{self._source_file}': {exc}")        
-
-    ##########################################
-    ################# TAGS ###################
-    ##########################################
-
-    async def _read_tags_from_content(self) -> list[str]:
-        """Extract tags from the formatted document content via the chat LLM.
-
-        Sends the first 3 000 characters of the formatted content together with
-        a tagging prompt that includes existing DMS tag names as hints.  The
-        model returns a JSON array of at most 3 tag name strings.
-
-        Returns:
-            List of tag name strings (may be empty).
-
-        Raises:
-            RuntimeError: If the LLM call fails or the response is not a valid
-                JSON array.
-        """
-        prompt = self._get_prompt_tags() + self._content[:3000]
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            raw = await self._llm_client.do_chat(messages)
-            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return [str(t) for t in data if t]
-            raise ValueError(f"Tag extraction LLM response is not a list for file '{self._source_file}': {raw}")
-        except Exception as exc:
-            raise RuntimeError(f"Failed to read tags from content using llm '{self._source_file}': {exc}") 
+        return bool(value.strip())            
 
     ##########################################
     ################# DMS ####################
@@ -631,3 +899,89 @@ class Document():
 
             Document text:
             """ % (self._language, tag_context)).strip()
+    
+    def _get_prompt_vision_ocr(self, context: str ="") -> str:
+        """Build the prompt for the Vision LLM OCR pass."""
+        context_hint = ("""
+            Context — the previous page ends with:"
+            ---
+            %s
+            ---
+
+            If this page continues a table or section from the previous page,
+            continue seamlessly without repeating column headers or section titles.
+            """ % context).strip()
+        context_hint = "" if not context.strip() else f"\n{context_hint}"
+
+        return ("""
+            /no_think
+            Convert this document page to clean Markdown.
+
+            Rules:
+                - Transcribe ONLY text that is actually visible in the image — never invent, guess, or fill in content.
+                - If a word or value is illegible, write [UNCLEAR] instead of guessing.
+                - Preserve ALL visible text and values exactly — do not summarise, skip, or paraphrase anything.
+                - Use ## for section headings.
+                - Use pipe tables for any tabular or structured key-value data.
+                - Use **bold** only for totals or key labels.
+                - Keep addresses, names, and flowing text as plain paragraphs.
+                - Output Markdown only — no explanations, no code fences, no commentary.
+            %s
+            """ % context_hint).strip()
+    
+    def _get_prompt_vision_legacy(self) -> str:
+        """Build the prompt for the Vision LLM OCR pass in legacy mode (no formatting)."""        
+        return ("""
+            Transcribe all text from this image exactly as it appears.
+            Output plain text only — no markdown, no bullet points, no headers, no formatting symbols. Preserve line breaks.
+            """).strip()
+    
+    def _get_prompt_format(self, unformatted_text:str)->str:
+        """Build the prompt for the formatting pass of the chat LLM, given unformatted text."""
+        return ("""
+            You are a document formatter. Format the following extracted document text as clean Markdown.
+            Rules:\n"
+            - Preserve ALL text and values exactly — do not summarise or omit anything.
+            - Use ## for section headings.
+            - Use pipe tables for any tabular or structured key-value data.
+            - Use **bold** only for totals or key labels.
+            - Keep addresses, names, and flowing text as plain paragraphs.
+            - Output Markdown only — no explanations, no code fences.
+            Document text:
+            ---
+            %s
+            ---
+            """ % unformatted_text).strip()
+    
+    def _get_prompt_merge(self, pages: list[str]) -> str:
+        """Build the prompt for the page-merging pass of the chat LLM, given the boundary overview."""
+        boundary_snippets: list[str] = []
+        for i in range(len(pages) - 1):
+            lines_a = [l for l in pages[i].splitlines() if l.strip()]
+            lines_b = [l for l in pages[i + 1].splitlines() if l.strip()]
+            # take last 5 non-empty lines of page A and first 5 non-empty lines of page B for context
+            tail_a = "\n".join(lines_a[-5:])
+            head_b = "\n".join(lines_b[:5])
+            
+            boundary_snippets.append(
+                "--- Boundary %d→%d ---\nEnd of page %d:\n%s\nStart of page %d:\n%s"
+                % (i, i + 1, i, tail_a, i + 1, head_b)
+            )
+
+        overview = "\n\n".join(boundary_snippets)
+        return ("""
+            You are a document assembler. A multi-page document was formatted page by page.
+            Review the page boundaries below and identify where content flows across the break
+            (unfinished sentence, continuing list, interrupted paragraph).
+                  
+            Return a JSON object:
+            {"merge_at_boundaries": [0, 3, ...]}
+                  
+
+            Use the 0-based boundary index (boundary 0 = between page 0 and page 1).
+            Only include boundaries where text is clearly mid-flow.
+            Do NOT include natural section or topic breaks.
+            Return ONLY the JSON object.
+                  
+            %s
+            """ % overview).strip()    

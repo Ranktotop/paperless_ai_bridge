@@ -89,7 +89,13 @@ def _read_engine_tasks(dms_clients: list[DMSClientInterface]) -> list[_EngineTas
 
 
 async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client) -> None:
-    """Scan each engine's directory once and ingest all found files."""
+    """Scan each engine's directory once and ingest all found files in batches.
+
+    Files are processed phase-by-phase within each batch so each LLM model
+    stays resident in VRAM for the full batch before being swapped out.
+    Batch size is controlled by ``DOC_INGESTION_BATCH_SIZE`` (0 = no limit).
+    """
+    batch_size = int(os.getenv("DOC_INGESTION_BATCH_SIZE", "0").strip())
     for task in tasks:
         service = IngestionService(
             helper_config=helper_config,
@@ -105,8 +111,7 @@ async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_c
             "Engine '%s': found %d file(s) in '%s'.",
             task.engine_name, len(files), task.path,
         )
-        for file_path in files:
-            await service.do_ingest_file(file_path=file_path, root_path=task.path)
+        await service.do_ingest_files_batch(file_paths=files, root_path=task.path, batch_size=batch_size)
 
 
 async def _run_watch(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client) -> None:

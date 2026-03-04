@@ -193,7 +193,7 @@ Copy `.env.example` to `.env` and fill in your values.
 | Variable | Default | Description |
 |---|---|---|
 | `LLM_ENGINE` | — | LLM backend, e.g. `ollama` |
-| `LLM_TIMEOUT` | `60` | HTTP timeout in seconds |
+| `LLM_TIMEOUT` | `600` | HTTP timeout in seconds |
 | `LLM_OLLAMA_BASE_URL` | — | Ollama base URL |
 | `LLM_OLLAMA_API_KEY` | — | Ollama Bearer token (optional) |
 | `LLM_MODEL_EMBEDDING` | — | Embedding model name (e.g. `nomic-embed-text`) |
