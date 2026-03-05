@@ -23,7 +23,9 @@
       "WebFetch(domain:www.reddit.com)",
       "WebFetch(domain:getomni.ai)",
       "WebFetch(domain:modal.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(pip show:*)",
+      "Bash(source:*)"
     ]
   }
 }

@@ -25,6 +25,7 @@ from shared.clients.cache.CacheClientManager import CacheClientManager
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.DMSClientManager import DMSClientManager
 from shared.clients.llm.LLMClientManager import LLMClientManager
+from shared.clients.ocr.OCRClientManager import OCRClientManager
 from services.doc_ingestion.IngestionService import IngestionService
 from services.doc_ingestion.helper.FileScanner import FileScanner
 
@@ -88,7 +89,7 @@ def _read_engine_tasks(dms_clients: list[DMSClientInterface]) -> list[_EngineTas
     return tasks
 
 
-async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client) -> None:
+async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client, ocr_client) -> None:
     """Scan each engine's directory once and ingest all found files in batches.
 
     Files are processed phase-by-phase within each batch so each LLM model
@@ -104,6 +105,7 @@ async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_c
             cache_client=cache_client,
             template=task.template,
             default_owner_id=task.owner_id,
+            ocr_client=ocr_client,
         )
         scanner = FileScanner(root_path=task.path)
         files = scanner.scan_once()
@@ -114,7 +116,7 @@ async def _run_once(tasks: list[_EngineTask], helper_config: HelperConfig, llm_c
         await service.do_ingest_files_batch(file_paths=files, root_path=task.path, batch_size=batch_size)
 
 
-async def _run_watch(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client) -> None:
+async def _run_watch(tasks: list[_EngineTask], helper_config: HelperConfig, llm_client, cache_client, ocr_client) -> None:
     """Watch each engine's directory concurrently and ingest on changes."""
     async def watch_engine(task: _EngineTask) -> None:
         service = IngestionService(
@@ -124,6 +126,7 @@ async def _run_watch(tasks: list[_EngineTask], helper_config: HelperConfig, llm_
             cache_client=cache_client,
             template=task.template,
             default_owner_id=task.owner_id,
+            ocr_client=ocr_client,
         )
         scanner = FileScanner(root_path=task.path)
         logging.info(
@@ -145,8 +148,9 @@ async def run() -> None:
     dms_clients = DMSClientManager(helper_config=helper_config).get_clients()
     llm_client = LLMClientManager(helper_config=helper_config).get_client()
     cache_client = CacheClientManager(helper_config=helper_config).get_client()
+    ocr_client = OCRClientManager(helper_config=helper_config).get_client()
 
-    for client in [*dms_clients, llm_client, cache_client]:
+    for client in [*dms_clients, llm_client, cache_client, ocr_client]:
         await client.boot()
 
     tasks = _read_engine_tasks(dms_clients)
@@ -161,11 +165,11 @@ async def run() -> None:
         await task.dms_client.fill_cache()
 
     if watch:
-        await _run_watch(tasks, helper_config, llm_client, cache_client)
+        await _run_watch(tasks, helper_config, llm_client, cache_client, ocr_client)
     else:
-        await _run_once(tasks, helper_config, llm_client, cache_client)
+        await _run_once(tasks, helper_config, llm_client, cache_client, ocr_client)
 
-    for client in [*dms_clients, llm_client, cache_client]:
+    for client in [*dms_clients, llm_client, cache_client, ocr_client]:
         await client.close()
 
 

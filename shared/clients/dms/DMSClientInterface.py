@@ -203,7 +203,7 @@ class DMSClientInterface(ClientInterface):
     def _get_endpoint_document_type_details(self, document_type_id: str) -> str:
         """
         Returns the endpoint path for document type details requests.
-        
+
         Args:
             document_type_id (str): The ID of the document type.
 
@@ -213,6 +213,42 @@ class DMSClientInterface(ClientInterface):
         Raises:
             NotImplementedError: If the method is not implemented in a subclass.
         """
+        pass
+
+    @abstractmethod
+    def _get_endpoint_create_correspondent(self) -> str:
+        pass
+
+    @abstractmethod
+    def _get_endpoint_create_document_type(self) -> str:
+        pass
+
+    @abstractmethod
+    def _get_endpoint_create_tag(self) -> str:
+        pass
+
+    @abstractmethod
+    def _get_endpoint_update_document(self, document_id: int) -> str:
+        pass
+
+    ##########################################
+    ############# PAYLOAD HOOKS ##############
+    ##########################################
+
+    @abstractmethod
+    def get_create_correspondent_payload(self, name: str) -> dict:
+        pass
+
+    @abstractmethod
+    def get_create_document_type_payload(self, name: str) -> dict:
+        pass
+
+    @abstractmethod
+    def get_create_tag_payload(self, name: str) -> dict:
+        pass
+
+    @abstractmethod
+    def get_update_document_payload(self, document_id: int, update: DocumentUpdateRequest) -> dict:
         pass
 
     ##########################################
@@ -460,7 +496,6 @@ class DMSClientInterface(ClientInterface):
         """
         pass
 
-    @abstractmethod
     async def do_create_correspondent(self, name: str) -> int:
         """Create a new correspondent in the DMS backend.
 
@@ -470,9 +505,14 @@ class DMSClientInterface(ClientInterface):
         Returns:
             int: The new correspondent ID.
         """
-        pass
+        payload = self.get_create_correspondent_payload(name)
+        response = await self.do_request(
+            method="POST", 
+            endpoint=self._get_endpoint_create_correspondent(), 
+            json=payload, 
+            raise_on_error=True)
+        return self._parse_endpoint_create_correspondent(response.json())
 
-    @abstractmethod
     async def do_create_document_type(self, name: str) -> int:
         """Create a new document type in the DMS backend.
 
@@ -482,9 +522,14 @@ class DMSClientInterface(ClientInterface):
         Returns:
             int: The new document type ID.
         """
-        pass
+        payload = self.get_create_document_type_payload(name)
+        response = await self.do_request(
+            method="POST", 
+            endpoint=self._get_endpoint_create_document_type(), 
+            json=payload, 
+            raise_on_error=True)
+        return self._parse_endpoint_create_document_type(response.json())
 
-    @abstractmethod
     async def do_create_tag(self, name: str) -> int:
         """Create a new tag in the DMS backend.
 
@@ -494,9 +539,14 @@ class DMSClientInterface(ClientInterface):
         Returns:
             int: The new tag ID.
         """
-        pass
+        payload = self.get_create_tag_payload(name)
+        response = await self.do_request(
+            method="POST", 
+            endpoint=self._get_endpoint_create_tag(), 
+            json=payload, 
+            raise_on_error=True)
+        return self._parse_endpoint_create_tag(response.json())
 
-    @abstractmethod
     async def do_update_document(
         self, document_id: int, update: DocumentUpdateRequest
     ) -> bool:
@@ -509,7 +559,16 @@ class DMSClientInterface(ClientInterface):
         Returns:
             True on success.
         """
-        pass
+        payload = self.get_update_document_payload(document_id, update)
+        if not payload:
+            return True
+        response = await self.do_request(
+            method="PATCH",
+            endpoint=self._get_endpoint_update_document(document_id),
+            json=payload,
+            raise_on_error=True
+        )
+        return self._parse_endpoint_update_document(response.json())
 
     async def do_resolve_or_create_correspondent(self, name: str) -> int:
         """Find existing correspondent by name in cache, or create a new one.
@@ -613,6 +672,23 @@ class DMSClientInterface(ClientInterface):
     ##########################################
     ########### RESPONSE PARSER ##############
     ##########################################
+
+    ############# WRITE RESPONSES ############
+    @abstractmethod
+    def _parse_endpoint_create_correspondent(self, response: dict) -> int:
+        pass
+
+    @abstractmethod
+    def _parse_endpoint_create_document_type(self, response: dict) -> int:
+        pass
+
+    @abstractmethod
+    def _parse_endpoint_create_tag(self, response: dict) -> int:
+        pass
+
+    @abstractmethod
+    def _parse_endpoint_update_document(self, response: dict) -> bool:
+        pass
 
     ############### LIST RESPONSES ###############
     @abstractmethod

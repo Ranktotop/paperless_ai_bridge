@@ -90,12 +90,21 @@ class LLMClientInterface(ClientInterface):
         """
         pass
 
+    @abstractmethod
+    def get_model_details_payload(self) -> dict:
+        """Build the backend-specific request body for a model details request.
+
+        Returns:
+            dict: JSON-serialisable request body (e.g. {"name": "..."}).
+        """
+        pass
+
     ##########################################
-    ################# OTHER ##################
+    ########### RESPONSE PARSER ##############
     ##########################################
 
     @abstractmethod
-    def extract_vector_size_from_model_info(self, model_info: dict) -> int:
+    def _parse_endpoint_model_details(self, model_info: dict) -> int:
         """Extracts the embedding vector size from the model information response.
 
         Args:
@@ -107,7 +116,7 @@ class LLMClientInterface(ClientInterface):
         pass
 
     @abstractmethod
-    def extract_embeddings_from_response(self, response_data: dict) -> list[list[float]]:
+    def _parse_endpoint_embedding(self, response_data: dict) -> list[list[float]]:
         """Extract embedding vectors from a raw embedding API response.
 
         Response format differs by backend:
@@ -123,7 +132,7 @@ class LLMClientInterface(ClientInterface):
         pass
 
     @abstractmethod
-    def extract_chat_response(self, response_data: dict) -> str:
+    def _parse_endpoint_chat(self, response_data: dict) -> str:
         """Extract the assistant reply text from a raw chat API response.
 
         Args:
@@ -150,11 +159,11 @@ class LLMClientInterface(ClientInterface):
         """
         response = await self.do_request(
             method="POST",
-            json={"name": self.embed_model},
+            json=self.get_model_details_payload(),
             endpoint=self.get_endpoint_model_details(),
             raise_on_error=True,
         )
-        vector_size = self.extract_vector_size_from_model_info(model_info=response.json())
+        vector_size = self._parse_endpoint_model_details(model_info=response.json())
         return vector_size, self.embed_distance
 
     async def do_embed(self, texts: list[str] | str) -> list[list[float]]:
@@ -176,7 +185,7 @@ class LLMClientInterface(ClientInterface):
                 response.text[:200],
             )
             raise Exception("Embedding request failed with status %d." % response.status_code)
-        return self.extract_embeddings_from_response(response.json())
+        return self._parse_endpoint_embedding(response.json())
 
     async def do_chat(self, messages: list[dict]) -> str:
         """Send a chat/completion request and return the assistant reply text.
@@ -199,7 +208,7 @@ class LLMClientInterface(ClientInterface):
             json=body,
             raise_on_error=True,
         )
-        return self.extract_chat_response(response.json())
+        return self._parse_endpoint_chat(response.json())
 
     async def do_chat_vision(self, messages: list[dict]) -> str:
         """Send a chat/completion request to vision model.
@@ -225,4 +234,4 @@ class LLMClientInterface(ClientInterface):
             json=body,
             raise_on_error=True,
         )
-        return self.extract_chat_response(response.json())
+        return self._parse_endpoint_chat(response.json())

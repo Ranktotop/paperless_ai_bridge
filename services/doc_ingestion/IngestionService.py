@@ -6,6 +6,7 @@ from shared.clients.cache.CacheClientInterface import CacheClientInterface, KEY_
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from shared.clients.dms.models.DocumentUpdate import DocumentUpdateRequest
 from shared.clients.llm.LLMClientInterface import LLMClientInterface
+from shared.clients.ocr.OCRClientInterface import OCRClientInterface
 from shared.helper.HelperConfig import HelperConfig
 from services.doc_ingestion.helper.Document import Document, DocumentValidationError, DocumentPathValidationError
 from shared.helper.HelperFile import HelperFile
@@ -22,7 +23,8 @@ class IngestionService:
         llm_client: LLMClientInterface,
         cache_client: CacheClientInterface,
         template: str | None = None,
-        default_owner_id: int | None = None
+        default_owner_id: int | None = None,
+        ocr_client: OCRClientInterface | None = None,
     ) -> None:
         self._config = helper_config
         self.logging = helper_config.get_logger()
@@ -31,6 +33,7 @@ class IngestionService:
         self._cache_client = cache_client
         self._template = template
         self._default_owner_id = default_owner_id
+        self._ocr_client = ocr_client
         self._helper_file = HelperFile()
 
     ##########################################
@@ -81,7 +84,8 @@ class IngestionService:
             dms_client=self._dms_client,
             path_template=self._template,
             file_bytes=file_bytes,
-            file_hash=file_hash
+            file_hash=file_hash,
+            ocr_client=self._ocr_client,
         )
         # Boot up the document
         try:
@@ -181,7 +185,8 @@ class IngestionService:
                 dms_client=self._dms_client,
                 path_template=self._template,
                 file_bytes=file_bytes,
-                file_hash=file_hash
+                file_hash=file_hash,
+                ocr_client=self._ocr_client,
             )
             # boot the document
             try:
@@ -216,20 +221,31 @@ class IngestionService:
 
         # Phase 3: Load the meta
         meta_docs: list[Document] = []
+        new_document_types = []
         for doc in formatted_docs:
             try:
-                await doc.load_metadata()
+                await doc.load_metadata(additional_doc_types=new_document_types)
                 meta_docs.append(doc)
+                # Collect the document types for the batch so they can be included as hints in the prompt for the next documents in the batch
+                chosen_doc_type = doc.get_metadata().document_type
+                if chosen_doc_type and chosen_doc_type not in new_document_types:
+                    new_document_types.append(chosen_doc_type)
             except Exception as e:
                 self.logging.error("Failed to load metadata for document '%s': %s", doc.get_source_file(True), e)
                 doc.cleanup()
 
         # Phase 4: Collect the tags
         tagged_docs: list[Document] = []
+        new_tags = []
         for doc in meta_docs:
             try:
-                await doc.load_tags()
+                await doc.load_tags(additional_tags=new_tags)
                 tagged_docs.append(doc)
+                #add the new tags to the list for the next documents in the batch so they are included as hints in the prompt
+                chosen_tags = doc.get_tags()
+                for tag in chosen_tags:
+                    if tag not in new_tags:
+                        new_tags.append(tag)
             except Exception as e:
                 self.logging.error("Failed to load tags for document '%s': %s", doc.get_source_file(True), e)
                 doc.cleanup()

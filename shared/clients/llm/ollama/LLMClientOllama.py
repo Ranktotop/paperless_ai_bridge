@@ -75,18 +75,22 @@ class LLMClientOllama(LLMClientInterface):
         model = self.chat_model or self.embed_model
         return {"model": model, "messages": messages, "stream": False}
 
+    ################ PAYLOAD BUILDER ##################
+    def get_model_details_payload(self) -> dict:
+        return {"name": self.embed_model}
+
     ##########################################
-    ################# OTHER ##################
+    ########### RESPONSE PARSER ##############
     ##########################################
 
-    def extract_vector_size_from_model_info(self, model_info: dict) -> int:
+    def _parse_endpoint_model_details(self, model_info: dict) -> int:
         info: dict = model_info.get("model_info", {})
         for key, value in info.items():
             if key.endswith(".embedding_length"):
                 return int(value)
         raise ValueError("Could not determine embedding vector size for model '%s'" % self.embed_model)
 
-    def extract_embeddings_from_response(self, response_data: dict) -> list[list[float]]:
+    def _parse_endpoint_embedding(self, response_data: dict) -> list[list[float]]:
         """Extract embedding vectors from an Ollama /api/embed response.
 
         Args:
@@ -106,7 +110,7 @@ class LLMClientOllama(LLMClientInterface):
             )
         return embeddings
 
-    def extract_chat_response(self, response_data: dict) -> str:
+    def _parse_endpoint_chat(self, response_data: dict) -> str:
         """Extract the assistant reply text from an Ollama /api/chat response.
 
         Args:

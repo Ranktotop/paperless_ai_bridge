@@ -91,8 +91,8 @@ class HelperConfig:
             ValueError: If the variable is not set and no default is provided.
         """        
         # Read raw value
-        raw_val = self.get_string_val(key=key, default=None)
-        if raw_val is None:
+        raw_val = self.get_string_val(key=key, default="")
+        if not raw_val.strip():
             if default is None:
                 raise ValueError(f"Environment variable '{key}' is not set.")
             return default

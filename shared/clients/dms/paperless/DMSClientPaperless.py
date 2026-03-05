@@ -11,6 +11,7 @@ from shared.clients.dms.models.Owner import OwnersListResponse, OwnerDetails
 from shared.clients.dms.models.DocumentType import DocumentTypesListResponse, DocumentTypeDetails
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
+import mimetypes
 
 # How long to wait between task-status polls (seconds).
 _TASK_POLL_INTERVAL_S: float = 2.0
@@ -133,8 +134,39 @@ class DMSClientPaperless(DMSClientInterface):
     def _get_endpoint_create_tag(self) -> str:
         return "/api/tags/"
 
-    def _get_endpoint_document_update(self, document_id: int) -> str:
+    def _get_endpoint_update_document(self, document_id: int) -> str:
         return "/api/documents/%d/" % document_id
+
+    ##########################################
+    ############# PAYLOAD HOOKS ##############
+    ##########################################
+
+    def get_create_correspondent_payload(self, name: str) -> dict:
+        return {"name": name}
+
+    def get_create_document_type_payload(self, name: str) -> dict:
+        return {"name": name}
+
+    def get_create_tag_payload(self, name: str) -> dict:
+        return {"name": name}
+
+    def get_update_document_payload(self, document_id: int, update: DocumentUpdateRequest) -> dict:
+        payload: dict = {}
+        if update.title is not None:
+            payload["title"] = update.title
+        if update.correspondent_id is not None:
+            payload["correspondent"] = update.correspondent_id
+        if update.document_type_id is not None:
+            payload["document_type"] = update.document_type_id
+        if update.tag_ids:
+            payload["tags"] = update.tag_ids
+        if update.content is not None:
+            payload["content"] = update.content
+        if update.created_date is not None:
+            payload["created"] = update.created_date
+        if update.owner_id is not None:
+            payload["owner"] = update.owner_id
+        return payload
 
     ##########################################
     ############# WRITE REQUESTS #############
@@ -152,7 +184,6 @@ class DMSClientPaperless(DMSClientInterface):
         created_date: str | None = None,
     ) -> int:
         """Upload a document to Paperless-ngx via multipart form POST."""
-        import mimetypes
         mime_type, _ = mimetypes.guess_type(file_name)
         mime_type = mime_type or "application/octet-stream"
 
@@ -271,74 +302,22 @@ class DMSClientPaperless(DMSClientInterface):
             % (task_uuid, file_name, _TASK_POLL_TIMEOUT_S)
         )
 
-    async def do_create_correspondent(self, name: str) -> int:
-        """Create a new correspondent in Paperless-ngx."""
-        response = await self.do_request(
-            method="POST",
-            endpoint=self._get_endpoint_create_correspondent(),
-            json={"name": name},
-            raise_on_error=True,
-        )
-        return int(response.json()["id"])
-
-    async def do_create_document_type(self, name: str) -> int:
-        """Create a new document type in Paperless-ngx."""
-        response = await self.do_request(
-            method="POST",
-            endpoint=self._get_endpoint_create_document_type(),
-            json={"name": name},
-            raise_on_error=True,
-        )
-        return int(response.json()["id"])
-
-    async def do_create_tag(self, name: str) -> int:
-        """Create a new tag in Paperless-ngx."""
-        response = await self.do_request(
-            method="POST",
-            endpoint=self._get_endpoint_create_tag(),
-            json={"name": name},
-            raise_on_error=True,
-        )
-        return int(response.json()["id"])
-
-    async def do_update_document(
-        self, document_id: int, update: DocumentUpdateRequest
-    ) -> bool:
-        """Update metadata fields of an existing document via PATCH."""
-        payload: dict = {}
-        if update.title is not None:
-            payload["title"] = update.title
-        if update.correspondent_id is not None:
-            payload["correspondent"] = update.correspondent_id
-        if update.document_type_id is not None:
-            payload["document_type"] = update.document_type_id
-        if update.tag_ids:
-            payload["tags"] = update.tag_ids
-        if update.content is not None:
-            payload["content"] = update.content
-        if update.created_date is not None:
-            payload["created"] = update.created_date
-        if update.owner_id is not None:
-            payload["owner"] = update.owner_id
-
-        if not payload:
-            return True
-
-        self.logging.info(
-            "Updating document id=%d in Paperless-ngx (fields: %s)...",
-            document_id, list(payload.keys()),
-        )
-        response = await self.do_request(
-            method="PATCH",
-            endpoint=self._get_endpoint_document_update(document_id),
-            json=payload,
-            raise_on_error=True,
-        )
-        return response.status_code in (200, 204)
-
     ##########################################
     ########### RESPONSE PARSER ##############
     ##########################################
+
+    ############# WRITE RESPONSES ############
+    def _parse_endpoint_create_correspondent(self, response: dict) -> int:
+        return int(response["id"])
+
+    def _parse_endpoint_create_document_type(self, response: dict) -> int:
+        return int(response["id"])
+
+    def _parse_endpoint_create_tag(self, response: dict) -> int:
+        return int(response["id"])
+
+    def _parse_endpoint_update_document(self, response: dict) -> bool:
+        return True
 
     ############### LIST RESPONSES ###############
     def _parse_endpoint_documents(self, response: dict, requested_page_size:int|None = None) -> DocumentsListResponse:
