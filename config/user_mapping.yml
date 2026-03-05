@@ -15,7 +15,7 @@
 users:
   "openwebui":
     "1":
-      paperless: 4
+      paperless: 3
   "anythingllm":
     "1":
-      paperless: 4
+      paperless: 3
