@@ -1,3 +1,5 @@
+import json
+
 from shared.clients.llm.LLMClientInterface import LLMClientInterface
 from shared.helper.HelperConfig import HelperConfig
 from shared.models.config import EnvConfig
@@ -110,6 +112,16 @@ class LLMClientOllama(LLMClientInterface):
             )
         return embeddings
 
+    def _is_default_chat_response(self, response_data: dict) -> bool:
+        """Return True if message.content is a non-empty string."""
+        content = response_data.get("message", {}).get("content")
+        return bool(content)
+
+    def _is_tool_call_response(self, response_data: dict) -> bool:
+        """Return True if message.tool_calls is present and non-empty."""
+        tool_calls = response_data.get("message", {}).get("tool_calls")
+        return bool(tool_calls)
+
     def _parse_endpoint_chat(self, response_data: dict) -> str:
         """Extract the assistant reply text from an Ollama /api/chat response.
 
@@ -130,3 +142,34 @@ class LLMClientOllama(LLMClientInterface):
                 "Response keys: %s" % list(response_data.keys())
             )
         return content
+
+    def _parse_tool_call_response(self, response_data: dict) -> str:
+        """Convert an Ollama native tool call response to ReAct-format text.
+
+        Ollama tool call responses have no content but carry a tool_calls list
+        and an optional thinking field. This method synthesises the ReAct lines
+        that the agent loop expects:
+
+            Thought: <thinking text>   (omitted when empty)
+            Action: <tool_name>
+            Action Input: <arguments as JSON>
+
+        Args:
+            response_data (dict): The parsed JSON response body.
+
+        Returns:
+            str: ReAct-formatted assistant text.
+        """
+        message = response_data.get("message", {})
+        tool_call = message.get("tool_calls", [{}])[0]
+        fn = tool_call.get("function", {})
+        tool_name = fn.get("name", "")
+        arguments = fn.get("arguments", {})
+
+        parts = []
+        thinking = message.get("thinking", "")
+        if thinking:
+            parts.append("Thought: %s" % thinking)
+        parts.append("Action: %s" % tool_name)
+        parts.append("Action Input: %s" % json.dumps(arguments, ensure_ascii=False))
+        return "\n".join(parts)

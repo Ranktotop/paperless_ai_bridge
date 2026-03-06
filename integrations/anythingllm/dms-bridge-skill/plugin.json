@@ -1,0 +1,80 @@
+{
+  "active": true,
+  "hubId": "dms-bridge-skill",
+  "name": "DMS Document Search",
+  "schema": "skill-1.0.0",
+  "version": "1.0.0",
+  "description": "Searches the personal document archive (invoices, contracts, letters, receipts, etc.) via dms_ai_bridge. Uses the ReAct agent for natural language answers, falls back to semantic search if unavailable.",
+  "author": "dms_ai_bridge",
+  "license": "MIT",
+  "setup_args": {
+    "DMS_BRIDGE_URL": {
+      "type": "string",
+      "required": true,
+      "input": {
+        "type": "text",
+        "default": "http://dms-bridge:8000",
+        "placeholder": "http://dms-bridge:8000",
+        "hint": "Base URL of the dms_ai_bridge server"
+      }
+    },
+    "DMS_BRIDGE_API_KEY": {
+      "type": "string",
+      "required": true,
+      "input": {
+        "type": "text",
+        "default": "",
+        "placeholder": "your-api-key",
+        "hint": "X-Api-Key header value for dms_ai_bridge authentication"
+      }
+    },
+    "DMS_BRIDGE_USER_ID": {
+      "type": "string",
+      "required": true,
+      "input": {
+        "type": "text",
+        "default": "1",
+        "placeholder": "1",
+        "hint": "Your AnythingLLM user ID (must be mapped in config/user_mapping.yml on the bridge server)"
+      }
+    },
+    "DMS_BRIDGE_LIMIT": {
+      "type": "string",
+      "required": false,
+      "input": {
+        "type": "text",
+        "default": "5",
+        "placeholder": "5",
+        "hint": "Maximum number of results returned by the fallback semantic search endpoint"
+      }
+    }
+  },
+  "examples": [
+    {
+      "prompt": "Search my documents for invoices from last year",
+      "call": "{\"query\": \"invoices from last year\"}"
+    },
+    {
+      "prompt": "Find all contracts with Max Mustermann",
+      "call": "{\"query\": \"contracts Max Mustermann\"}"
+    },
+    {
+      "prompt": "Do I have any insurance documents?",
+      "call": "{\"query\": \"insurance documents\"}"
+    },
+    {
+      "prompt": "Show me receipts from the supermarket",
+      "call": "{\"query\": \"supermarket receipts\"}"
+    }
+  ],
+  "entrypoint": {
+    "file": "handler.js",
+    "params": {
+      "query": {
+        "description": "Natural language search query for the personal document archive",
+        "type": "string"
+      }
+    }
+  },
+  "imported": true
+}

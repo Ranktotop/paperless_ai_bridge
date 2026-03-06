@@ -103,6 +103,36 @@ class PointHighDetails(PointDetails):
     # only on search results, not on scrolls
     vector: list[float] | None = None
 
+    def get_as_prompt_search_result(self, max_chars: int = -1) -> str:
+        """Erstellt eine formatierte Text-Repräsentation für ein LLM-Prompt."""
+        content = self.chunk_text or ""
+        if max_chars > 0:
+            content = content[:max_chars] + ("..." if len(content) > max_chars else "")
+        return "\n".join([
+            "### %s" % self.title or self.dms_doc_id,
+            "%.3f" % self.score or 0.0,
+            "Content:",
+            "---",
+            "%s" % content,
+            "---"])
+
+    def get_as_prompt_details(self, max_chars: int = -1) -> str:
+        """Erstellt eine formatierte Text-Repräsentation für ein LLM-Prompt."""
+        content = self.chunk_text or ""
+        if max_chars > 0:
+            content = content[:max_chars] + ("..." if len(content) > max_chars else "")
+        return "\n".join([
+            "---",
+            "Document ID: %s" % self.dms_doc_id,
+            "Title: %s" % (self.title or "Unknown"),
+            "Engine: %s" % (self.dms_engine or "Unknown"),
+            "Correspondent: %s" % (self.category_name or "Unknown"),
+            "Document Type: %s" % (self.type_name or "Unknown"),
+            "Tags: %s" % (", ".join(self.label_names) or "None"),
+            "Created: %s" % (self.created or "Unknown"),
+            "Content: ```\n%s\n```" % content,
+            "---"])
+
 class PointsListResponse(BaseModel):
     """
     Represents the response from a RAG client when fetching a list of points.

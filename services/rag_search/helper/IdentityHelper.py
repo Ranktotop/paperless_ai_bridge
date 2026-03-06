@@ -25,7 +25,10 @@ class IdentityHelper:
     #################################
 
     def get_identities(self) -> list[IdentityMap]:
-        """Returns the list of IdentityMap instances representing the resolved identities for this user."""
+        """
+        Returns the list of IdentityMap instances representing the resolved identities for this user.
+        The elements are showing which owner_id the base user has on which dms_engine.
+        """
         return self._map
     
     def has_mappings(self) -> bool:

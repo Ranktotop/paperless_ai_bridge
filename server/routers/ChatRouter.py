@@ -3,17 +3,18 @@
 POST /chat/{frontend}         — single response
 POST /chat/{frontend}/stream  — SSE streaming response
 """
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from server.dependencies.auth import verify_api_key
-from server.dependencies.services import get_react_agent, get_user_mapping_service, get_dms_clients
+from server.dependencies.services import get_agent_service, get_user_mapping_service, get_dms_clients
 from server.models.requests import SearchRequest
 from server.models.responses import ChatResponse
 from server.user_mapping.UserMappingService import UserMappingService
-from services.rag_search.agent.ReActAgent import ReActAgent
+from services.agent.AgentService import AgentService
 from shared.clients.dms.DMSClientInterface import DMSClientInterface
 from services.rag_search.helper.IdentityHelper import IdentityHelper
 
@@ -24,7 +25,7 @@ router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(verify_a
 async def chat_documents(
     frontend: str,
     body: SearchRequest,
-    react_agent: ReActAgent = Depends(get_react_agent),
+    agent_service: AgentService = Depends(get_agent_service),
     user_mapping_service: UserMappingService = Depends(get_user_mapping_service),
     dms_clients: list[DMSClientInterface] = Depends(get_dms_clients),
 ) -> ChatResponse:
@@ -36,29 +37,39 @@ async def chat_documents(
     Args:
         frontend: AI system identifier from the URL path (e.g. "openwebui").
         body: JSON body with query, user_id, limit, and optional chat_history.
-        react_agent: Injected ReActAgent from app state.
+        agent_service: Injected AgentService from app state.
         user_mapping_service: Injected mapping service from app state.
         dms_clients: Injected list of DMS clients.
 
     Returns:
         ChatResponse: Synthesised answer from the ReAct agent.
     """
+    # build the identity map for the user
     identity_helper = IdentityHelper(
         user_mapping_service=user_mapping_service,
         dms_clients=dms_clients,
         frontend=frontend,
         user_id=body.user_id,
     )
+    # make sure the requesting user is mapped to anything
     if not identity_helper.has_mappings():
         raise HTTPException(
             status_code=403,
             detail="No mapping found for frontend '%s', user_id '%s' in any configured engine."
             % (frontend, body.user_id),
         )
-    agent_response = await react_agent.do_run(
+    
+    # read settings from send body
+    client_settings = {"dms_limit": body.limit if body.limit is not None else 5} 
+    
+    # let the agent do his work
+    agent_response = await agent_service.do_run(
         query=body.query,
-        identity_helper=identity_helper,
         chat_history=body.chat_history,
+        max_iterations=5,
+        step_callback=None,
+        identity_helper=identity_helper,
+        client_settings=client_settings
     )
     return ChatResponse(query=body.query, answer=agent_response.answer)
 
@@ -67,7 +78,7 @@ async def chat_documents(
 async def chat_documents_stream(
     frontend: str,
     body: SearchRequest,
-    react_agent: ReActAgent = Depends(get_react_agent),
+    agent_service: AgentService = Depends(get_agent_service),
     user_mapping_service: UserMappingService = Depends(get_user_mapping_service),
     dms_clients: list[DMSClientInterface] = Depends(get_dms_clients),
 ) -> StreamingResponse:
@@ -83,28 +94,58 @@ async def chat_documents_stream(
     Returns:
         StreamingResponse with text/event-stream media type.
     """
+    # build the identity map for the user
     identity_helper = IdentityHelper(
         user_mapping_service=user_mapping_service,
         dms_clients=dms_clients,
         frontend=frontend,
         user_id=body.user_id,
     )
+    # make sure the requesting user is mapped to anything
     if not identity_helper.has_mappings():
         raise HTTPException(
             status_code=403,
             detail="No mapping found for frontend '%s', user_id '%s' in any configured engine."
             % (frontend, body.user_id),
         )
-
+    
+    # define event generator for responding in realtime as the agent produces output
     async def event_generator():
-        agent_response = await react_agent.do_run(
-            query=body.query,
-            identity_helper=identity_helper,
-            chat_history=body.chat_history,
-        )
-        for word in agent_response.answer.split(" "):
-            yield "data: %s\n\n" % json.dumps({"chunk": word + " "})
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        # define callback to receive intermediate steps from the agent and put them in the queue
+        async def step_callback(step: str) -> None:
+            await queue.put("data: %s\n\n" % json.dumps({"type": "step", "chunk": step}))
+
+        # run the agent in a separate task to not block the event generator
+        async def run_agent() -> None:
+
+            # read settings from send body
+            client_settings = {"dms_limit": body.limit if body.limit is not None else 5}
+            try:
+                # let the agent do his work
+                agent_response = await agent_service.do_run(
+                    query=body.query,
+                    identity_helper=identity_helper,
+                    chat_history=body.chat_history,
+                    step_callback=step_callback,
+                    client_settings=client_settings,
+                )
+                for word in agent_response.answer.split(" "):
+                    await queue.put("data: %s\n\n" % json.dumps({"type": "answer", "chunk": word + " "}))
+            except Exception as e:
+                await queue.put("data: %s\n\n" % json.dumps({"chunk": "Error: %s" % str(e)}))
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run_agent())
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
         yield "data: [DONE]\n\n"
+        await task
 
     return StreamingResponse(
         event_generator(),

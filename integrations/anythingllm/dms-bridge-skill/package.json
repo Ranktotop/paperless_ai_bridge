@@ -1,0 +1,7 @@
+{
+  "name": "dms-bridge-skill",
+  "version": "1.0.0",
+  "description": "DMS AI Bridge document search skill for AnythingLLM",
+  "main": "handler.js",
+  "dependencies": {}
+}

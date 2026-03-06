@@ -21,11 +21,12 @@ from shared.clients.llm.LLMClientManager import LLMClientManager
 from shared.clients.ClientInterface import ClientInterface
 from services.dms_rag_sync.SyncService import SyncService
 from services.rag_search.SearchService import SearchService
+from server.routers.HealthRouter import router as health_router
 from server.routers.WebhookRouter import router as webhook_router
 from server.routers.QueryRouter import router as query_router
 from server.routers.ChatRouter import router as chat_router
 from server.user_mapping.UserMappingService import UserMappingService
-from services.rag_search.agent.ReActAgent import ReActAgent
+from services.agent.AgentService import AgentService
 
 logging = setup_logging()
 app_version = os.getenv("APP_VERSION", "unknown")
@@ -68,7 +69,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cache_client=cache_client,
     )
     app.state.user_mapping_service = UserMappingService()
-    app.state.react_agent = ReActAgent(
+    app.state.agent_service = AgentService(
         helper_config=app.state.helper_config,
         search_service=app.state.search_service,
         llm_client=llm_client,
@@ -106,6 +107,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(health_router)
 app.include_router(webhook_router)
 app.include_router(query_router)
 app.include_router(chat_router)

@@ -120,13 +120,22 @@ class LLMHelper:
 
         # Apply hard limits to ensure prompt fits within context window even in worst case. Log a warning if limits are hit, as this may degrade classification quality.
         if len(correspondents) > self._max_filter_values:
-            self.logging.warning(f"Number of correspondents after filtering ({len(correspondents)}) exceeds max of {self._max_filter_values}. Truncating list, which may degrade classification quality.")
+            self.logging.warning(
+                "Number of correspondents after filtering (%d) exceeds max of %d. Truncating list, which may degrade classification quality.",
+                len(correspondents), self._max_filter_values,
+            )
             correspondents = correspondents[: self._max_filter_values]
         if len(document_types) > self._max_filter_values:
-            self.logging.warning(f"Number of document types after filtering ({len(document_types)}) exceeds max of {self._max_filter_values}. Truncating list, which may degrade classification quality.")
+            self.logging.warning(
+                "Number of document types after filtering (%d) exceeds max of %d. Truncating list, which may degrade classification quality.",
+                len(document_types), self._max_filter_values,
+            )
             document_types = document_types[: self._max_filter_values]
         if len(tags) > self._max_filter_values:
-            self.logging.warning(f"Number of tags after filtering ({len(tags)}) exceeds max of {self._max_filter_values}. Truncating list, which may degrade classification quality.")
+            self.logging.warning(
+                "Number of tags after filtering (%d) exceeds max of %d. Truncating list, which may degrade classification quality.",
+                len(tags), self._max_filter_values,
+            )
             tags = tags[: self._max_filter_values]
 
         return MergedRagResponseOption(
@@ -168,7 +177,10 @@ class LLMHelper:
         if not isinstance(correspondent, str) or not correspondent.strip():
             correspondent = None
         if correspondent and correspondent not in options.correspondents:
-            self.logging.warning(f"LLM returned a correspondent value that was not in the provided options: {correspondent}", color="yellow")
+            self.logging.warning(
+                "LLM returned a correspondent value that was not in the provided options: %s",
+                correspondent, color="yellow",
+            )
             correspondent = None
 
         #check if document_type is set and in the list
@@ -176,7 +188,10 @@ class LLMHelper:
         if not isinstance(document_type, str) or not document_type.strip():
             document_type = None
         if document_type and document_type not in options.document_types:
-            self.logging.warning(f"LLM returned a document_type value that was not in the provided options: {document_type}", color="yellow")
+            self.logging.warning(
+                "LLM returned a document_type value that was not in the provided options: %s",
+                document_type, color="yellow",
+            )
             document_type = None
 
         #check if tags is a list and all values are in the options
@@ -186,7 +201,10 @@ class LLMHelper:
             tags = [t.strip() for t in raw_tags if isinstance(t, str) and t.strip()]        
             for tag in tags:
                 if tag not in options.tags:
-                    self.logging.warning(f"LLM returned a tag value that was not in the provided options: {tag}", color="yellow")
+                    self.logging.warning(
+                        "LLM returned a tag value that was not in the provided options: %s",
+                        tag, color="yellow",
+                    )
                 else:
                     extracted_tags.append(tag)
 

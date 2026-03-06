@@ -140,7 +140,10 @@ class SearchService:
                 c for c in must_conditions
                 if c.get("key") not in ("type_name", "label_names")
             ]
-            self.logging.debug(f"Search in RAG returned 0 results using filters {filters}. Retrying with {search_name} filters (removed type and tags).")
+            self.logging.debug(
+                "Search in RAG returned 0 results using filters %s. Retrying with %s filters (removed type and tags).",
+                filters, search_name,
+            )
             results = await self._execute_search(
                 query_vector, {"must": fallback_conditions}
             )
@@ -148,9 +151,55 @@ class SearchService:
         self.logging.info("Search in RAG (%s) returned %d result(s).", search_name, len(results))
         # sort results by score desc and apply limit
         results.sort(key=lambda r: r.score, reverse=True)
-        if limit > 0:
+        if limit > 0 and len(results) > limit:
             self.logging.info("Fetched more results than requested. Returning only top %d results of %d.", limit, len(results))
             results = results[:limit]        
+        return results
+
+    async def do_fetch_by_doc_id(
+        self,
+        doc_id: str,
+        dms_engine: str,
+        owner_id: str,
+    ) -> list[PointHighDetails]:
+        """Fetch all chunks for a specific document by its DMS document ID.
+
+        Uses do_fetch_points() with exact-match filters — deterministic, no vector search.
+        Returns an empty list if the document is not found or not owned by owner_id.
+
+        Args:
+            doc_id: DMS document ID (string).
+            dms_engine: DMS engine name (e.g. "paperless").
+            owner_id: Owner ID as string — enforced for access isolation.
+
+        Returns:
+            List of PointHighDetails for all chunks of the document.
+        """
+        filters = [
+            {"key": "dms_doc_id", "match": {"value": doc_id}},
+            {"key": "dms_engine", "match": {"value": dms_engine}},
+            {"key": "owner_id",   "match": {"value": owner_id}},
+        ]
+        fetch_tasks = [
+            rag_client.do_fetch_points(
+                filters=filters,
+                include_fields=True,
+                with_vector=False,
+            )
+            for rag_client in self._rag_clients
+        ]
+        responses = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+        results: list[PointHighDetails] = []
+        for idx, points in enumerate(responses):
+            if isinstance(points, Exception):
+                self.logging.warning(
+                    "SearchService.do_fetch_by_doc_id: RAG client [%d] failed: %s",
+                    idx, points,
+                )
+                continue
+            results.extend(points)
+        results.sort(key=lambda r: r.chunk_index or 0)
         return results
 
     ##########################################

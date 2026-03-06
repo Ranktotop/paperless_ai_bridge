@@ -266,10 +266,10 @@ class SyncService:
                 tags=tags,
                 document_type=document_type,
             )
-        except Exception as exc:
+        except Exception as e:
             self.logging.error(
                 "Incremental sync: failed to fetch/build document id=%d from DMS '%s': %s",
-                document_id, engine, exc,
+                document_id, engine, e,
             )
             return
 
@@ -292,10 +292,10 @@ class SyncService:
                         "Incremental sync: document id=%d in DMS '%s' was skipped (no content or missing owner_id).",
                         document_id, engine,
                     )
-            except Exception as exc:
+            except Exception as e:
                 self.logging.error(
                     "Incremental sync: failed to sync document id=%d to RAG '%s': %s",
-                    document_id, rag_client.get_engine_name(), exc,
+                    document_id, rag_client.get_engine_name(), e,
                 )
 
         # update filter cache — pass the old owner_id so a lost/changed owner
@@ -386,10 +386,10 @@ class SyncService:
                 include_fields=["dms_doc_id", "content_hash"],
                 with_vector=False,
             )
-        except Exception as exc:
+        except Exception as e:
             self.logging.error(
                 "Failed to load RAG hashes for engine '%s': %s. All documents will be re-synced.",
-                engine, exc,
+                engine, e,
             )
             return {}
 
@@ -427,9 +427,9 @@ class SyncService:
             success = await rag_client.do_delete_points_by_filter(delete_filter)
             if not success:
                 raise Exception("RAG client reported delete failure for document id=%s." % doc_id)
-        except Exception as exc:
+        except Exception as e:
             self.logging.error(
-                "Failed to delete vectors for document id=%s: %s", doc_id, exc
+                "Failed to delete vectors for document id=%s: %s", doc_id, e
             )
 
     async def _validate_document(
@@ -520,9 +520,9 @@ class SyncService:
             try:
                 # batch embed — one HTTP request for all chunks of this document
                 vectors = await self._embed_client.do_embed(texts=chunks)
-            except Exception as exc:
+            except Exception as e:
                 self.logging.error(
-                    "Embedding failed for document id=%s ('%s'): %s", doc.id, doc.title, exc, color="red"
+                    "Embedding failed for document id=%s ('%s'): %s", doc.id, doc.title, e, color="red"
                 )
                 raise
 
@@ -537,9 +537,9 @@ class SyncService:
                 success = await rag_client.do_delete_points_by_filter(delete_filter)
                 if not success:
                     raise Exception("RAG client reported delete failure for document id=%s." % doc.id)
-            except Exception as exc:
+            except Exception as e:
                 self.logging.error(
-                    "Delete-before-upsert failed for document id=%s: %s", doc.id, exc, color="red"
+                    "Delete-before-upsert failed for document id=%s: %s", doc.id, e, color="red"
                 )
                 raise
 
@@ -576,9 +576,9 @@ class SyncService:
                     success = await rag_client.do_upsert_points(batch)
                     if not success:
                         raise Exception("RAG client reported upsert failure for batch starting at index %d." % batch_start)
-            except Exception as exc:
+            except Exception as e:
                 self.logging.error(
-                    "Upsert failed for document id=%s: %s", doc.id, exc, color="red"
+                    "Upsert failed for document id=%s: %s", doc.id, e, color="red"
                 )
                 raise
 
@@ -619,8 +619,8 @@ class SyncService:
             )
             for point in points:
                 rag_doc_ids.add(point.dms_doc_id)
-        except Exception as exc:
-            self.logging.error("Orphan cleanup scroll failed: %s. Skipping cleanup.", exc, color="red")
+        except Exception as e:
+            self.logging.error("Orphan cleanup scroll failed: %s. Skipping cleanup.", e, color="red")
             return
 
         orphan_ids = rag_doc_ids - dms_ids
@@ -642,10 +642,10 @@ class SyncService:
                 if not success:
                     raise Exception("RAG client reported delete failure for document id=%s." % orphan_id)
                 removed += 1
-            except Exception as exc:
+            except Exception as e:
                 self.logging.error(
                     "Orphan cleanup: failed to delete vectors for engine='%s' dms_doc_id=%s: %s",
-                    engine, orphan_id, exc, color="red"
+                    engine, orphan_id, e, color="red"
                 )
 
         self.logging.info("Orphan cleanup complete: removed vectors for %d document(s).", removed, color="green")
@@ -684,9 +684,9 @@ class SyncService:
             )
             if points:
                 return int(points[0].owner_id)
-        except Exception as exc:
+        except Exception as e:
             self.logging.warning(
-                "Could not fetch current owner_id for document id=%s from RAG: %s", doc_id, exc
+                "Could not fetch current owner_id for document id=%s from RAG: %s", doc_id, e
             )
         return None
 
@@ -719,10 +719,10 @@ class SyncService:
                     "Filter cache invalidated for engine=%s, old owner_id=%d after owner change on document id=%s.",
                     doc.engine, old_owner_id, doc.id,
                 )
-            except Exception as exc:
+            except Exception as e:
                 self.logging.warning(
                     "Failed to invalidate old filter cache for engine=%s, owner_id=%d: %s",
-                    doc.engine, old_owner_id, exc,
+                    doc.engine, old_owner_id, e,
                 )
 
         if not doc.owner_id:
@@ -753,9 +753,9 @@ class SyncService:
                 "Filter cache merged for engine=%s, owner_id=%d after incremental sync of document id=%s.",
                 doc.engine, doc.owner_id, doc.id,
             )
-        except Exception as exc:
+        except Exception as e:
             self.logging.warning(
-                "Failed to merge filter cache for owner_id=%d: %s", doc.owner_id, exc
+                "Failed to merge filter cache for owner_id=%d: %s", doc.owner_id, e
             )
 
     async def _update_filter_cache(self, enriched_docs: list[DocumentHighDetails]) -> None:
@@ -772,8 +772,8 @@ class SyncService:
         # so that owners who have lost all their documents are cleaned up
         try:
             await self._cache_client.do_delete_pattern("%s:*" % KEY_FILTER_OPTIONS)
-        except Exception as exc:
-            self.logging.warning("Failed to clear filter cache before full rebuild: %s", exc)
+        except Exception as e:
+            self.logging.warning("Failed to clear filter cache before full rebuild: %s", e)
 
         by_engine_owner: dict[tuple[str, int], dict] = {}
         for doc in enriched_docs:
@@ -811,8 +811,8 @@ class SyncService:
                     len(options["document_types"]),
                     len(options["tags"]),
                 )
-            except Exception as exc:
+            except Exception as e:
                 self.logging.warning(
                     "Failed to write filter cache for engine=%s, owner_id=%d: %s",
-                    engine_name, oid, exc,
+                    engine_name, oid, e,
                 )

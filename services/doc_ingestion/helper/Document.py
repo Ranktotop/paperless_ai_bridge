@@ -455,8 +455,8 @@ class Document():
                 else:
                     self.logging.info(f"No text extracted programmatically from page {page_num + 1} of file '{self._source_filename}'", color="yellow")
             doc.close()
-        except Exception as exc:
-            self.logging.error("Error extracting text programmatically from file '%s': %s", self._converted_file, exc)
+        except Exception as e:
+            self.logging.error("Error extracting text programmatically from file '%s': %s", self._converted_file, e)
             return []
         return page_texts
     
@@ -502,8 +502,8 @@ class Document():
                     else:
                         self.logging.info(f"No text extracted by fallback direct reading from page {page_num + 1} of file '{self._source_filename}'", color="yellow")
             doc.close()
-        except Exception as exc:
-            self.logging.error("Error extracting text by vision LLM from file '%s': %s", self._converted_file, exc)
+        except Exception as e:
+            self.logging.error("Error extracting text by vision LLM from file '%s': %s", self._converted_file, e)
             return []
         return page_texts
 

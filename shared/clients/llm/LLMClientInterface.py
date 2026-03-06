@@ -17,6 +17,7 @@ class LLMClientInterface(ClientInterface):
 
         # chat / completion config
         self.chat_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_MODEL_CHAT")
+        self.chat_model_max_chars = helper_config.get_number_val(f"{self.get_client_type().upper()}_MODEL_CHAT_MAX_CHARS")
         self.vision_model = helper_config.get_string_val(f"{self.get_client_type().upper()}_MODEL_VISION")
 
     ##########################################
@@ -42,6 +43,14 @@ class LLMClientInterface(ClientInterface):
     def get_embed_model(self) -> str:
         """Return the configured embedding model name."""
         return self.embed_model
+    
+    def get_embed_model_max_chars(self) -> int:
+        """Return the maximum input character length for the embedding model."""
+        return self.embed_model_max_chars
+    
+    def get_chat_model_max_chars(self) -> int:
+        """Return the maximum input character length for the chat/completion model."""
+        return self.chat_model_max_chars
 
     ################ ENDPOINTS ##################
     @abstractmethod
@@ -143,6 +152,65 @@ class LLMClientInterface(ClientInterface):
         """
         pass
 
+    @abstractmethod
+    def _parse_tool_call_response(self, response_data: dict) -> str:
+        """Extract the assistant reply text from a raw chat API response indicating a tool call.
+
+        Args:
+            response_data (dict): The parsed JSON response body.
+
+        Returns:
+            str: The assistant reply text.
+        """
+        pass
+
+    def _parse_delegated_chat_response(self, response_data: dict) -> str:
+        """Route the raw chat API response to the appropriate parser.
+
+        Checks in order: standard text reply → native tool call → error.
+        Subclasses control routing by implementing _is_default_chat_response()
+        and _is_tool_call_response().
+
+        Args:
+            response_data (dict): The parsed JSON response body.
+
+        Returns:
+            str: The assistant reply text.
+
+        Raises:
+            ValueError: If the response matches neither a standard reply nor a tool call.
+        """
+        if self._is_default_chat_response(response_data):
+            return self._parse_endpoint_chat(response_data)
+        if self._is_tool_call_response(response_data):
+            return self._parse_tool_call_response(response_data)
+        raise ValueError("Unexpected chat response format: %s" % list(response_data.keys()))
+
+    @abstractmethod
+    def _is_default_chat_response(self, response_data: dict) -> bool:
+        """Return True if the response is a standard text reply (not a native tool call).
+
+        Args:
+            response_data (dict): The parsed JSON response body.
+
+        Returns:
+            bool: True if _parse_endpoint_chat should handle this response.
+        """
+        pass
+
+    @abstractmethod
+    def _is_tool_call_response(self, response_data: dict) -> bool:
+        """Return True if the response contains a native tool call.
+
+        Args:
+            response_data (dict): The parsed JSON response body.
+
+        Returns:
+            bool: True if _parse_tool_call_response should handle this response.
+        """
+        pass
+
+
     ##########################################
     ############### REQUESTS #################
     ##########################################
@@ -208,7 +276,7 @@ class LLMClientInterface(ClientInterface):
             json=body,
             raise_on_error=True,
         )
-        return self._parse_endpoint_chat(response.json())
+        return self._parse_delegated_chat_response(response_data=response.json())
 
     async def do_chat_vision(self, messages: list[dict]) -> str:
         """Send a chat/completion request to vision model.
@@ -235,3 +303,5 @@ class LLMClientInterface(ClientInterface):
             raise_on_error=True,
         )
         return self._parse_endpoint_chat(response.json())
+    
+    

@@ -9,7 +9,7 @@ frontends (OpenWebUI, AnythingLLM) via semantic search.
 
 Users ask questions in natural language about their documents. The bridge indexes all
 documents from a DMS into a vector database and answers search queries through a FastAPI
-server. In Phase IV a LangChain ReAct agent takes over intent classification and result
+server. A custom ReAct agent (no LangChain) handles intent classification and result
 synthesis.
 
 ---
@@ -60,8 +60,8 @@ picks them up automatically.
 |---|---|---|
 | I | Shared infrastructure, DMS client, RAG client, SyncService | Complete |
 | II | LLM client (embedding via Ollama) | Complete |
-| III | FastAPI server — POST /webhook/{engine}/document + POST /query (scroll-based) | Pending |
-| IV | LangChain ReAct agent, vector similarity search, LLM synthesis | Pending |
+| III | FastAPI server — POST /webhook/{engine}/document + POST /query (scroll-based) | Complete |
+| IV | Custom ReAct agent, vector similarity search, LLM synthesis | Complete |
 
 ---
 
@@ -383,8 +383,10 @@ dms_ai_bridge/
 └── server/
     ├── api_server.py                    ← FastAPI entry point with lifespan
     ├── routers/
+    │   ├── HealthRouter.py              ← GET /health, GET /health/deep (no auth)
     │   ├── WebhookRouter.py             ← POST /webhook/{engine}/document
-    │   └── QueryRouter.py               ← POST /query/{frontend} (thin adapter → SearchService)
+    │   ├── QueryRouter.py               ← POST /query/{frontend} (thin adapter → SearchService)
+    │   └── ChatRouter.py                ← POST /chat/{frontend} + /stream (ReAct agent)
     ├── dependencies/
     │   ├── auth.py                      ← X-API-Key verification
     │   └── services.py                  ← FastAPI Depends helpers (get_search_service, …)
@@ -546,7 +548,7 @@ changing search/ranking logic in `SearchService`.
 **Key rules:**
 - `do_incremental_sync(document_id: int, engine: str) -> None` is the public API contract
   with api-agent's `WebhookRouter` — never change this signature without notifying api-agent
-- `do_search(query: str, owner_id: int, limit: int, chat_history: list[dict] | None) -> list[SearchResult]`
+- `do_search(query: str, identity_helper: IdentityHelper, chat_history: list[dict] | None, limit: int) -> list[PointHighDetails]`
   is the public API contract with api-agent's `QueryRouter` — never change this signature
   without notifying api-agent
 - `SearchService` calls `CacheClientInterface` for filter option lookup and
@@ -667,8 +669,10 @@ pdf backend), or adding new conversion capabilities to `OCRClientInterface`.
 
 **Owns:**
 - `server/api_server.py` — FastAPI entry point with lifespan
+- `server/routers/HealthRouter.py` — `GET /health`, `GET /health/deep`
 - `server/routers/WebhookRouter.py` — `POST /webhook/{engine}/document`
 - `server/routers/QueryRouter.py` — `POST /query/{frontend}` (thin adapter over `SearchService`)
+- `server/routers/ChatRouter.py` — `POST /chat/{frontend}` + `POST /chat/{frontend}/stream`
 - `server/dependencies/auth.py` — `X-API-Key` verification
 - `server/dependencies/services.py` — FastAPI `Depends` helpers
 - `server/models/requests.py` — `WebhookRequest`, `SearchRequest`
@@ -692,7 +696,7 @@ auth middleware.
 - `QueryRouter` is a thin adapter: resolve user_id → owner_id → call `SearchService.do_search()` →
   map `list[SearchResult]` to `SearchResponse` — no embed, scroll, or LLM logic in the router
 - Every subdirectory under `server/` needs `__init__.py` for uvicorn module resolution
-- Phase IV: use `WebSearch` to look up current `create_react_agent` API before implementing
+- Phase IV is complete — custom ReAct agent in `services/rag_search/agent/ReActAgent.py`
 
 **API contracts:**
 ```
@@ -795,6 +799,35 @@ Documents without `owner_id` are skipped at sync time — no silent writes.
 
 ### Language
 All code, variable names, comments, docstrings, and log messages: **English**.
+
+### Style reference — always read an existing file of the same type first
+Before creating any new file, read the nearest existing implementation of the same
+type and match its structure exactly:
+- New service → any existing service in `services/` as reference
+- New client  → any existing client in `shared/clients/` as reference
+- New router  → any existing router in `server/routers/` as reference
+
+### Prompts / strings / constants — always via getters, never module-level
+Never define prompts, system messages, or multi-line strings as module-level
+variables or constants. Always expose them via getter methods:
+
+```python
+# correct
+def _get_system_prompt(self) -> str:
+    return "You are a ..."
+
+# WRONG
+SYSTEM_PROMPT = "You are a ..."
+```
+
+### Single Responsibility — helper classes, not fat classes
+- One class does one thing
+- Extract sub-functionality into dedicated helper classes
+- Never accumulate unrelated methods in one class
+
+### Naming
+- Services: `*Service.py` (e.g. `AgentService`, not `ReActAgent`)
+- No deep structural nesting — prefer `services/agent` over `services/rag_search/agent`
 
 ---
 

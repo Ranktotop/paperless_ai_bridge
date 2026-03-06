@@ -70,8 +70,8 @@ relevant interface and are picked up automatically by setting the appropriate en
 | I | Shared infrastructure, DMS client, RAG client, SyncService | Complete |
 | II | LLM client — embedding + chat via Ollama | Complete |
 | II+ | Cache client (Redis), OCR client (Docling), Document ingestion pipeline | Complete |
-| III | FastAPI server — `POST /webhook/{engine}/document` + `POST /query/{frontend}` | Pending |
-| IV | LangChain ReAct agent, vector similarity search, LLM synthesis | Pending |
+| III | FastAPI server — `POST /webhook/{engine}/document` + `POST /query/{frontend}` | Complete |
+| IV | Custom ReAct agent, vector similarity search, LLM synthesis | Complete |
 
 ### Phase I — Infrastructure (complete)
 
@@ -117,18 +117,20 @@ relevant interface and are picked up automatically by setting the appropriate en
   - `Document` — path template parsing, OCR, Vision LLM OCR fallback, LLM metadata + tag extraction
   - `IngestionService` — orchestrates boot → upload → PATCH → cleanup
 
-### Phase III — FastAPI Server (pending)
+### Phase III — FastAPI Server (complete)
 
 - `POST /webhook/{engine}/document` — fire-and-forget incremental sync via `BackgroundTasks`
 - `POST /query/{frontend}` — embed query → `do_search_points()` with `owner_id` filter → `SearchResponse`
 - `UserMappingService` — resolves `(frontend, user_id)` → `owner_id` via `config/user_mapping.yml`
 - `X-API-Key` authentication on all endpoints
+- `GET /health` — shallow health check (no auth); `GET /health/deep` — probes all backends
 
-### Phase IV — Agentic Logic (pending)
+### Phase IV — Agentic Logic (complete)
 
-- LangChain ReAct agent with multi-step reasoning
-- Intent classification: metadata query vs. full-text search
-- Result synthesis with LLM summarisation and DMS source links
+- Custom ReAct agent with multi-step reasoning (no LangChain dependency)
+- LLM-based query classification — extracts correspondent, document type, and tag filters
+- Result synthesis with LLM summarisation
+- SSE streaming via `POST /chat/{frontend}/stream`
 
 ---
 
@@ -316,12 +318,12 @@ DEBUG Syncing document 42 ('Invoice ACME 2024'): 3 chunk(s).
 INFO  Full sync complete.
 ```
 
-### API server (Phase III — pending)
+### API server
 
 ```bash
 bash start.sh
 # or directly:
-uvicorn server.api_server:app --host 0.0.0.0 --port 8080
+uvicorn server.api_server:app --host 0.0.0.0 --port 8000
 ```
 
 ### With Docker Compose
@@ -334,9 +336,29 @@ docker compose -f .docker/docker-compose.yml up -d
 
 ---
 
-## API Endpoints (Phase III — pending)
+## API Endpoints
 
-All endpoints require the `X-API-Key` header matching `APP_API_KEY`.
+### `GET /health`
+
+Shallow health check — no authentication required.
+
+**Response**
+```json
+{ "status": "ok" }
+```
+
+### `GET /health/deep`
+
+Deep health check — probes all configured backends. No authentication required.
+
+**Response**
+```json
+{ "status": "ok", "backends": { "paperless": "ok", "qdrant": "ok", "ollama": "ok", "redis": "ok" } }
+```
+
+---
+
+All endpoints below require the `X-API-Key` header matching `APP_API_KEY`.
 
 ### `POST /webhook/{engine}/document`
 
@@ -355,7 +377,7 @@ as a background task and returns immediately.
 
 ### `POST /query/{frontend}`
 
-Natural language search against the Qdrant vector index.
+Semantic vector search against the Qdrant index with LLM-based query classification.
 
 **Request**
 ```json
@@ -367,14 +389,68 @@ Natural language search against the Qdrant vector index.
 {
   "query": "Invoice from ACME 2024",
   "results": [
-    { "dms_doc_id": 42, "title": "Invoice ACME", "score": 0.91, "chunk_text": "..." }
+    { "dms_doc_id": "42", "title": "Invoice ACME", "score": 0.91, "chunk_text": "..." }
   ],
   "total": 1
 }
 ```
 
+### `POST /chat/{frontend}`
+
+ReAct agent — returns a synthesised natural language answer.
+
+**Request**
+```json
+{ "query": "Summarise my invoices from 2024", "user_id": "5" }
+```
+
+**Response**
+```json
+{ "query": "Summarise my invoices from 2024", "answer": "In 2024 you received..." }
+```
+
+### `POST /chat/{frontend}/stream`
+
+ReAct agent — streams the answer word-by-word as Server-Sent Events.
+
+**SSE format**
+```
+data: {"chunk": "In "}
+data: {"chunk": "2024 "}
+...
+data: [DONE]
+```
+
 `user_id` is resolved to an internal `owner_id` via `UserMappingService` before any search
 is performed. Unknown users receive HTTP 403 — no fallback default owner.
+
+---
+
+## Integrations
+
+Pre-built connectors are available in the `integrations/` directory.
+
+### OpenWebUI (`integrations/openwebui/pipeline.py`)
+
+A pipeline plugin that connects OpenWebUI to dms_ai_bridge via the `/chat/openwebui` and
+`/chat/openwebui/stream` endpoints.
+
+1. Copy `integrations/openwebui/pipeline.py` to your OpenWebUI `pipelines/` directory.
+2. Restart OpenWebUI and configure the Valves in Admin Panel → Pipelines:
+   - `BASE_URL` — dms_ai_bridge server URL (default: `http://dms-bridge:8000`)
+   - `API_KEY` — matches `APP_API_KEY` in your `.env`
+   - `USER_ID` — OpenWebUI user ID mapped in `config/user_mapping.yml`
+
+### AnythingLLM (`integrations/anythingllm/dms_bridge_skill.js`)
+
+An agent skill that gives AnythingLLM document search capabilities via `/chat/anythingllm`
+(falls back to `/query/anythingllm` if the chat endpoint is unavailable).
+
+1. Copy `integrations/anythingllm/dms_bridge_skill.js` to the AnythingLLM skills directory.
+2. Enable the "DMS Document Search" skill in Agent Settings and configure:
+   - `API_URL` — dms_ai_bridge server URL (default: `http://dms-bridge:8000`)
+   - `API_KEY` — matches `APP_API_KEY` in your `.env`
+   - `USER_ID` — AnythingLLM user ID mapped in `config/user_mapping.yml`
 
 ---
 
