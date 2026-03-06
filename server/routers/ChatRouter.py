@@ -133,6 +133,7 @@ async def chat_documents_stream(
                 )
                 for word in agent_response.answer.split(" "):
                     await queue.put("data: %s\n\n" % json.dumps({"type": "answer", "chunk": word + " "}))
+                await queue.put("data: %s\n\n" % json.dumps({"type": "step", "chunk": "✅ Fertig"}))
             except Exception as e:
                 await queue.put("data: %s\n\n" % json.dumps({"chunk": "Error: %s" % str(e)}))
             finally:
