@@ -281,6 +281,35 @@ Factory: `CacheClientManager` — reads `CACHE_ENGINE` from env
 
 ---
 
+### `OCRClientInterface` (`shared/clients/ocr/OCRClientInterface.py`)
+
+ABC for all OCR backends. Used by the document ingestion pipeline to convert files to
+Markdown text via an external OCR service.
+
+Key method (concrete):
+- `do_convert_pdf_to_markdown(file_bytes: bytes, filename: str) -> str`
+  — uploads file bytes, returns extracted Markdown; raises `RuntimeError` on failure
+
+Instance attributes:
+- `self.timeout` — reads `OCR_TIMEOUT` (default: `300` s)
+
+Abstract hooks subclasses must implement:
+```
+_get_engine_name()
+_get_base_url()
+_get_auth_header()
+_get_endpoint_healthcheck()
+_get_endpoint_convert_pdf_to_markdown()
+_get_required_config()
+_get_convert_pdf_to_markdown_payload(file_bytes, filename)   → multipart files arg
+_parse_convert_file_response(response)                       → Markdown str
+```
+
+Current implementation: `OCRClientDocling`
+Factory: `OCRClientManager` — reads `OCR_ENGINE` from env
+
+---
+
 ## Directory Structure
 
 ```
@@ -317,15 +346,21 @@ dms_ai_bridge/
 │   │   │   ├── CacheClientManager.py    ← factory (reflection-based)
 │   │   │   └── redis/
 │   │   │       └── CacheClientRedis.py
-│   │   └── rag/
-│   │       ├── RAGClientInterface.py    ← RAG ABC
-│   │       ├── RAGClientManager.py      ← factory (reflection-based)
-│   │       ├── models/
-│   │       │   └── Point.py             ← all RAG point models (request + response, owner_id mandatory)
-│   │       └── qdrant/
-│   │           └── RAGClientQdrant.py
+│   │   ├── rag/
+│   │   │   ├── RAGClientInterface.py    ← RAG ABC
+│   │   │   ├── RAGClientManager.py      ← factory (reflection-based)
+│   │   │   ├── models/
+│   │   │   │   └── Point.py             ← all RAG point models (request + response, owner_id mandatory)
+│   │   │   └── qdrant/
+│   │   │       └── RAGClientQdrant.py
+│   │   └── ocr/
+│   │       ├── OCRClientInterface.py    ← OCR ABC (do_convert_pdf_to_markdown)
+│   │       ├── OCRClientManager.py      ← factory (reflection-based)
+│   │       └── docling/
+│   │           └── OCRClientDocling.py
 │   ├── helper/
-│   │   └── HelperConfig.py              ← central env var reader
+│   │   ├── HelperConfig.py              ← central env var reader
+│   │   └── HelperFile.py               ← file system helpers
 │   ├── logging/
 │   │   └── logging_setup.py             ← setup_logging(), ColorLogger
 │   └── models/
@@ -365,7 +400,7 @@ dms_ai_bridge/
 
 ## Agent Responsibilities
 
-Eight specialised agents own distinct subsystems. Invoke the correct agent for any task
+Nine specialised agents own distinct subsystems. Invoke the correct agent for any task
 touching that subsystem. Agents that own interfaces must coordinate before changing
 public method signatures.
 
@@ -599,6 +634,31 @@ correspondent, document_type, year, month, day, title, filename
 **Coordination:**
 - `do_chat_vision()` on `LLMClientInterface` must be implemented by embed-llm-agent
 - DMS write methods must be implemented by dms-agent
+- `OCRClientInterface` is owned by ocr-agent — do not modify it here
+
+---
+
+### `ocr-agent` — OCR Client Subsystem
+**Model:** `claude-sonnet-4-6`
+
+**Owns:**
+- `shared/clients/ocr/OCRClientInterface.py`
+- `shared/clients/ocr/OCRClientManager.py`
+- `shared/clients/ocr/docling/OCRClientDocling.py`
+
+**Invoke when:**
+adding a new OCR backend, changing how documents are converted to Markdown, debugging
+OCR service responses, adjusting Docling conversion parameters (formats, OCR flags,
+pdf backend), or adding new conversion capabilities to `OCRClientInterface`.
+
+**Key rules:**
+- `do_convert_pdf_to_markdown()` must never return an empty string — raise `RuntimeError`
+  if the service returns empty or failed content
+- Multipart payloads use the `files` argument to `do_request` — never `data` — to
+  produce an AsyncByteStream-compatible MultipartStream for httpx
+- Default timeout is `300` s (`OCR_TIMEOUT`) — OCR is inherently slow; do not lower it
+  without confirming with ingestion-agent
+- `OCR_ENGINE` controls which backend is loaded — factory loads via reflection
 
 ---
 
@@ -720,6 +780,7 @@ LLM_OLLAMA_BASE_URL        LLM_OLLAMA_API_KEY
 LLM_MODEL_EMBEDDING        LLM_MODEL_CHAT         LLM_DISTANCE
 CACHE_REDIS_BASE_URL       CACHE_REDIS_PASSWORD   CACHE_REDIS_DB
 CACHE_DEFAULT_TTL_SECONDS  LLM_MAX_FILTER_VALUES_PER_CATEGORY
+OCR_ENGINE                 OCR_TIMEOUT                        OCR_DOCLING_BASE_URL       OCR_DOCLING_API_KEY
 USER_MAPPING_FILE          (path to user_mapping.yml, default: config/user_mapping.yml)
 ```
 
@@ -747,7 +808,8 @@ All code, variable names, comments, docstrings, and log messages: **English**.
 | Redis, `CacheClientInterface`, filter option cache, cache invalidation | `cache-agent` |
 | Ollama, `LLMClientInterface`, embedding, chat, new LLM provider | `embed-llm-agent` |
 | Sync pipeline, `SyncService`, `SearchService`, orphan cleanup | `service-agent` |
-| File ingestion, `Document`, `DocumentConverter`, `IngestionService`, OCR | `ingestion-agent` |
+| File ingestion, `Document`, `DocumentConverter`, `IngestionService` | `ingestion-agent` |
+| `OCRClientInterface`, `OCRClientDocling`, `OCR_ENGINE`, Docling backend | `ocr-agent` |
 | FastAPI routes, `QueryRouter`, webhook, auth, Phase III/IV server | `api-agent` |
 | `UserMappingService`, `user_mapping.yml`, frontend/user_id resolution | `api-agent` |
 

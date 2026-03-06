@@ -109,3 +109,5 @@ Wraps LibreOffice (`soffice`) for format conversion.
 - `do_chat_vision()` on `LLMClientInterface` must be provided by embed-llm-agent
 - DMS write methods (`do_upload_document`, `do_update_document`, `do_resolve_or_create_*`)
   must be implemented by dms-agent before `IngestionService` can upload
+- `OCRClientInterface` and its implementations are owned by ocr-agent — do not modify
+  them here; if OCR behaviour changes, coordinate with ocr-agent

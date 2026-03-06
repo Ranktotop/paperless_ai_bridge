@@ -5,16 +5,26 @@ Intelligent middleware between Document Management Systems (e.g.
 [Open WebUI](https://github.com/open-webui/open-webui) or
 [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm).
 
-The bridge indexes all documents from a DMS into a [Qdrant](https://qdrant.tech/) vector
-database using [Ollama](https://ollama.com/) embeddings. A FastAPI server (Phase III) will
-expose a semantic search endpoint and a webhook listener so the index stays in sync whenever
-a document is added or updated.
+The bridge indexes documents from a DMS into a [Qdrant](https://qdrant.tech/) vector database
+using [Ollama](https://ollama.com/) embeddings. A separate ingestion pipeline converts and
+uploads files from a local inbox into Paperless-ngx. A FastAPI server (Phase III) exposes a
+semantic search endpoint and a webhook listener so the index stays in sync whenever a document
+is added or updated.
 
 ---
 
 ## Architecture
 
 ```
+File Inbox
+  │
+  ▼
+IngestionService ──► DocumentConverter (LibreOffice) ──► Document (OCR + LLM metadata)
+  │                                                           │
+  ▼                                                           ▼
+DMSClientInterface.do_upload_document()            OCRClientInterface (Docling)
+  │                                                LLMClientInterface (Vision + Chat)
+  ▼
 DMS (Paperless-ngx)
   │
   ▼
@@ -30,10 +40,11 @@ RAGClientInterface.do_upsert_points()   Ollama /api/embed
 Qdrant (vector store, owner_id-filtered)
   ▲
   │
-FastAPI (POST /query)           ← Phase III
+FastAPI (POST /query/{frontend})        ← Phase III
+  │── UserMappingService.resolve(frontend, user_id, engine) → owner_id
   │── LLMClientInterface.do_embed()
   │── RAGClientInterface.do_search_points()
-  └── LLMClientInterface.do_chat()    ← Phase IV
+  └── LLMClientInterface.do_chat()      ← Phase IV
 ```
 
 Interface hierarchy (generic → concrete):
@@ -42,12 +53,13 @@ Interface hierarchy (generic → concrete):
 ClientInterface
   ├── DMSClientInterface  ──► DMSClientPaperless
   ├── RAGClientInterface  ──► RAGClientQdrant
-  └── LLMClientInterface  ──► LLMClientOllama
+  ├── LLMClientInterface  ──► LLMClientOllama
+  ├── CacheClientInterface ─► CacheClientRedis
+  └── OCRClientInterface  ──► OCRClientDocling
 ```
 
-Additional DMS backends, RAG backends, and LLM providers can be added without touching the
-core pipeline — new implementations satisfy the relevant interface and the factory picks them
-up automatically via reflection.
+All backends are loaded via reflection-based factories — new implementations satisfy the
+relevant interface and are picked up automatically by setting the appropriate env var.
 
 ---
 
@@ -57,7 +69,8 @@ up automatically via reflection.
 |---|---|---|
 | I | Shared infrastructure, DMS client, RAG client, SyncService | Complete |
 | II | LLM client — embedding + chat via Ollama | Complete |
-| III | FastAPI server — `POST /webhook/document` + `POST /query` | Pending |
+| II+ | Cache client (Redis), OCR client (Docling), Document ingestion pipeline | Complete |
+| III | FastAPI server — `POST /webhook/{engine}/document` + `POST /query/{frontend}` | Pending |
 | IV | LangChain ReAct agent, vector similarity search, LLM synthesis | Pending |
 
 ### Phase I — Infrastructure (complete)
@@ -68,7 +81,8 @@ up automatically via reflection.
   - `DocumentHighDetails` — canonical output model with resolved correspondent, tags, type, owner
 - `RAGClientInterface` (ABC) + `RAGClientQdrant` — Qdrant REST client via httpx
   - Deterministic point IDs (`uuid5(engine:doc_id:chunk_index)`)
-  - `do_upsert_points()`, `do_fetch_points()`, `do_search_points()`, `do_count()`, `do_delete_points_by_filter()`, `do_create_collection()`
+  - `do_upsert_points()`, `do_fetch_points()`, `do_search_points()`, `do_count()`,
+    `do_delete_points_by_filter()`, `do_create_collection()`
 - `SyncService` — full sync (all documents) + incremental sync (single document)
   - Text chunking: character-level, `CHUNK_SIZE=1000`, `CHUNK_OVERLAP=100`
   - `asyncio.Semaphore(DOC_CONCURRENCY=5)` — bounded concurrency
@@ -83,16 +97,31 @@ up automatically via reflection.
   - `do_embed(texts)` → `list[list[float]]` — always returns a list, even for a single string
   - `do_fetch_embedding_vector_size()` → `(dimension, distance_metric)`
   - `do_chat(messages)` → `str` — OpenAI-format message dicts
+  - `do_chat_vision(image_bytes, prompt)` → `str` — Vision LLM call
 - `LLMClientOllama` — implements all abstract hooks for Ollama
   - Embedding: `POST /api/embed`
-  - Chat: `POST /api/chat` with `"stream": False`
+  - Chat: `POST /api/chat` with `"stream": false`
   - Vector size discovery via `POST /api/show`
-  - Optional Bearer-token auth
+
+### Phase II+ — Cache, OCR, Ingestion (complete)
+
+- `CacheClientInterface` (ABC) + `CacheClientRedis` — cross-process cache via Redis
+  - `do_get_json` / `do_set_json` for structured data
+  - `do_delete_pattern()` for namespace-level invalidation
+- `OCRClientInterface` (ABC) + `OCRClientDocling` — PDF-to-Markdown conversion
+  - `do_convert_pdf_to_markdown(file_bytes, filename)` → `str`
+  - Sends multipart request to Docling `POST /v1/convert/file`
+- Document ingestion pipeline (`services/doc_ingestion/`)
+  - `FileScanner` — rglob + watchfiles file discovery
+  - `DocumentConverter` — LibreOffice headless PDF conversion
+  - `Document` — path template parsing, OCR, Vision LLM OCR fallback, LLM metadata + tag extraction
+  - `IngestionService` — orchestrates boot → upload → PATCH → cleanup
 
 ### Phase III — FastAPI Server (pending)
 
-- `POST /webhook/document` — fire-and-forget incremental sync via `BackgroundTasks`
-- `POST /query` — embed query → `do_search_points()` with `owner_id` filter → `SearchResponse`
+- `POST /webhook/{engine}/document` — fire-and-forget incremental sync via `BackgroundTasks`
+- `POST /query/{frontend}` — embed query → `do_search_points()` with `owner_id` filter → `SearchResponse`
+- `UserMappingService` — resolves `(frontend, user_id)` → `owner_id` via `config/user_mapping.yml`
 - `X-API-Key` authentication on all endpoints
 
 ### Phase IV — Agentic Logic (pending)
@@ -115,45 +144,68 @@ dms_ai_bridge/
 │   ├── clients/
 │   │   ├── ClientInterface.py           # Base ABC (lifecycle, auth, do_request)
 │   │   ├── dms/
-│   │   │   ├── DMSClientInterface.py    # DMS ABC
-│   │   │   ├── DMSClientManager.py      # Factory (reflection-based)
+│   │   │   ├── DMSClientInterface.py    # DMS ABC (fill_cache, write methods)
+│   │   │   ├── DMSClientManager.py      # Factory
 │   │   │   ├── models/                  # Document, Correspondent, Tag, Owner, DocumentType
 │   │   │   └── paperless/
 │   │   │       └── DMSClientPaperless.py
 │   │   ├── llm/
-│   │   │   ├── LLMClientInterface.py    # Unified ABC (embed + chat)
-│   │   │   ├── LLMClientManager.py      # Factory (reflection-based)
+│   │   │   ├── LLMClientInterface.py    # Unified ABC (embed + chat + vision)
+│   │   │   ├── LLMClientManager.py      # Factory
 │   │   │   └── ollama/
 │   │   │       └── LLMClientOllama.py
-│   │   └── rag/
-│   │       ├── RAGClientInterface.py    # RAG ABC
-│   │       ├── RAGClientManager.py      # Factory (reflection-based)
-│   │       ├── models/                  # Point.py (request + response models)
-│   │       └── qdrant/
-│   │           └── RAGClientQdrant.py
+│   │   ├── rag/
+│   │   │   ├── RAGClientInterface.py    # RAG ABC
+│   │   │   ├── RAGClientManager.py      # Factory
+│   │   │   ├── models/                  # Point.py (request + response models)
+│   │   │   └── qdrant/
+│   │   │       └── RAGClientQdrant.py
+│   │   ├── cache/
+│   │   │   ├── CacheClientInterface.py  # Cache ABC (get/set/delete/delete_pattern)
+│   │   │   ├── CacheClientManager.py    # Factory
+│   │   │   └── redis/
+│   │   │       └── CacheClientRedis.py
+│   │   └── ocr/
+│   │       ├── OCRClientInterface.py    # OCR ABC (do_convert_pdf_to_markdown)
+│   │       ├── OCRClientManager.py      # Factory
+│   │       └── docling/
+│   │           └── OCRClientDocling.py
 │   ├── helper/
-│   │   └── HelperConfig.py              # Central env var reader
+│   │   ├── HelperConfig.py              # Central env var reader
+│   │   └── HelperFile.py               # File system helpers
 │   ├── logging/
 │   │   └── logging_setup.py             # setup_logging(), ColorLogger
 │   └── models/
 │       └── config.py                    # EnvConfig Pydantic model
 ├── services/
-│   └── dms_rag_sync/
-│       ├── SyncService.py               # DMS → embed → RAG orchestration
-│       └── dms_rag_sync.py              # Entry point (python -m services.dms_rag_sync.dms_rag_sync)
-└── server/                              # Phase III/IV — not yet created
-    └── api/
-        ├── api_app.py
-        ├── routers/
-        │   ├── WebhookRouter.py         # POST /webhook/document
-        │   └── QueryRouter.py           # POST /query
-        ├── services/
-        │   └── QueryService.py
-        ├── dependencies/
-        │   └── auth.py                  # X-API-Key verification
-        └── models/
-            ├── requests.py
-            └── responses.py
+│   ├── doc_ingestion/
+│   │   ├── IngestionService.py          # Orchestrator (boot → upload → PATCH)
+│   │   ├── doc_ingestion.py             # Entry point (python -m services.doc_ingestion)
+│   │   └── helper/
+│   │       ├── Document.py              # Central document class (convert, OCR, metadata, tags)
+│   │       ├── DocumentConverter.py     # LibreOffice PDF conversion helper
+│   │       └── FileScanner.py           # rglob + watchfiles file discovery
+│   ├── dms_rag_sync/
+│   │   ├── SyncService.py               # DMS → embed → RAG orchestration
+│   │   └── dms_rag_sync.py              # Entry point (python -m services.dms_rag_sync)
+│   └── rag_search/
+│       └── SearchService.py             # embed → search → list[SearchResult]
+├── config/
+│   └── user_mapping.yml                 # frontend/user_id → DMS owner_id mapping
+└── server/                              # Phase III/IV
+    ├── api_server.py                    # FastAPI entry point with lifespan
+    ├── routers/
+    │   ├── WebhookRouter.py             # POST /webhook/{engine}/document
+    │   └── QueryRouter.py               # POST /query/{frontend}
+    ├── dependencies/
+    │   ├── auth.py                      # X-API-Key verification
+    │   └── services.py                  # FastAPI Depends helpers
+    ├── models/
+    │   ├── requests.py                  # WebhookRequest, SearchRequest
+    │   └── responses.py                 # SearchResultItem, SearchResponse
+    └── user_mapping/
+        ├── UserMappingService.py        # resolve(frontend, user_id, engine) → owner_id
+        └── models.py                    # UserMapping Pydantic models
 ```
 
 ---
@@ -167,7 +219,8 @@ Copy `.env.example` to `.env` and fill in your values.
 | Variable | Default | Description |
 |---|---|---|
 | `LOG_LEVEL` | `info` | Logging level (`debug`, `info`, `warning`, `error`) |
-| `APP_API_KEY` | — | Secret key required in `X-API-Key` header (Phase III) |
+| `APP_API_KEY` | — | Secret key required in `X-API-Key` header |
+| `LANGUAGE` | `German` | Language for LLM-extracted text (metadata, tags) |
 
 ### DMS
 
@@ -197,15 +250,44 @@ Copy `.env.example` to `.env` and fill in your values.
 | `LLM_OLLAMA_BASE_URL` | — | Ollama base URL |
 | `LLM_OLLAMA_API_KEY` | — | Ollama Bearer token (optional) |
 | `LLM_MODEL_EMBEDDING` | — | Embedding model name (e.g. `nomic-embed-text`) |
-| `LLM_MODEL_EMBEDDING_MAX_CHARS` | — | Max characters per chunk passed to the embedding model |
-| `LLM_MODEL_CHAT` | — | Chat model name (e.g. `llama3.2`); optional, falls back to `LLM_MODEL_EMBEDDING` |
+| `LLM_MODEL_EMBEDDING_MAX_CHARS` | — | Max characters per chunk |
+| `LLM_MODEL_CHAT` | — | Chat model (e.g. `llama3.2`); falls back to `LLM_MODEL_EMBEDDING` |
+| `LLM_MODEL_VISION` | — | Vision model for image-based OCR (e.g. `llava`) |
 | `LLM_DISTANCE` | `Cosine` | Qdrant distance metric (`Cosine`, `Dot`, `Euclid`) |
+
+### Cache (Redis)
+
+| Variable | Default | Description |
+|---|---|---|
+| `CACHE_ENGINE` | — | Cache backend, e.g. `redis` |
+| `CACHE_REDIS_BASE_URL` | — | Redis URL (e.g. `redis://localhost:6379`) |
+| `CACHE_REDIS_PASSWORD` | — | Redis password (optional) |
+| `CACHE_REDIS_DB` | `0` | Redis database index |
+| `CACHE_DEFAULT_TTL_SECONDS` | `86400` | Safety-net TTL for cached values |
+
+### OCR (Docling)
+
+| Variable | Default | Description |
+|---|---|---|
+| `OCR_ENGINE` | — | OCR backend, e.g. `docling` |
+| `OCR_TIMEOUT` | `300` | HTTP timeout in seconds (OCR is slow) |
+| `OCR_DOCLING_BASE_URL` | — | Docling server base URL |
+| `OCR_DOCLING_API_KEY` | — | Docling API key (optional) |
+
+### Document Ingestion
+
+| Variable | Default | Description |
+|---|---|---|
+| `DOC_INGESTION_SKIP_OCR_READ` | `false` | Skip PyMuPDF direct read, always use OCR |
+| `DOC_INGESTION_MINIMUM_TEXT_CHARS_FOR_DIRECT_READ` | `40` | Min chars per page before Vision LLM fallback |
+| `DOC_INGESTION_PAGE_DPI` | `150` | DPI for Vision LLM page rendering |
+| `DOC_INGESTION_VISION_CONTEXT_CHARS` | `300` | Chars of preceding text passed as context to Vision LLM |
 
 ---
 
 ## Running
 
-### Full sync (one-shot)
+### Document ingestion (file inbox → Paperless-ngx)
 
 ```bash
 python3 -m venv .venv
@@ -215,7 +297,13 @@ pip install -r requirements.txt
 cp .env.example .env
 # fill in .env
 
-python -m services.dms_rag_sync.dms_rag_sync
+python -m services.doc_ingestion
+```
+
+### Full DMS → RAG sync (one-shot)
+
+```bash
+python -m services.dms_rag_sync
 ```
 
 Expected log output:
@@ -231,10 +319,9 @@ INFO  Full sync complete.
 ### API server (Phase III — pending)
 
 ```bash
-# Once Phase III is implemented:
 bash start.sh
 # or directly:
-uvicorn server.api.api_app:app --host 0.0.0.0 --port 8080
+uvicorn server.api_server:app --host 0.0.0.0 --port 8080
 ```
 
 ### With Docker Compose
@@ -247,33 +334,14 @@ docker compose -f .docker/docker-compose.yml up -d
 
 ---
 
-## Verifying the Index
-
-After a successful sync, inspect the Qdrant collection directly:
-
-```bash
-# Count indexed points
-curl http://localhost:6333/collections/<RAG_QDRANT_COLLECTION>
-
-# Inspect the first few points
-curl -X POST http://localhost:6333/collections/<RAG_QDRANT_COLLECTION>/points/scroll \
-  -H "Content-Type: application/json" \
-  -d '{"limit": 3, "include_fields": true, "with_vector": false}'
-```
-
-Each point's payload contains `dms_doc_id`, `owner_id`, `title`, `chunk_text`, and the
-resolved metadata fields (`correspondent`, `tags`, `category`, etc.).
-
----
-
 ## API Endpoints (Phase III — pending)
 
 All endpoints require the `X-API-Key` header matching `APP_API_KEY`.
 
-### `POST /webhook/document`
+### `POST /webhook/{engine}/document`
 
-Called by Paperless-ngx after a document is added or updated.
-Triggers an incremental sync as a background task and returns immediately.
+Called by Paperless-ngx after a document is added or updated. Triggers an incremental sync
+as a background task and returns immediately.
 
 **Request**
 ```json
@@ -285,18 +353,13 @@ Triggers an incremental sync as a background task and returns immediately.
 { "status": "accepted", "document_id": 42 }
 ```
 
-**Paperless-ngx webhook configuration**\
-In the Paperless-ngx admin, use the built-in workflow triggers to `POST` to
-`http://<bridge-host>:8080/webhook/document` with the body
-`{"document_id": {{ document.pk }}}` and the `X-API-Key` header.
-
-### `POST /query`
+### `POST /query/{frontend}`
 
 Natural language search against the Qdrant vector index.
 
 **Request**
 ```json
-{ "query": "Invoice from ACME 2024", "owner_id": 1, "limit": 5 }
+{ "query": "Invoice from ACME 2024", "user_id": "5", "limit": 5 }
 ```
 
 **Response**
@@ -310,12 +373,15 @@ Natural language search against the Qdrant vector index.
 }
 ```
 
+`user_id` is resolved to an internal `owner_id` via `UserMappingService` before any search
+is performed. Unknown users receive HTTP 403 — no fallback default owner.
+
 ---
 
 ## Security
 
-- Every request to `/webhook/document` and `/query` must carry the `X-API-Key` header
-  matching `APP_API_KEY`.
-- `owner_id` is enforced unconditionally on every Qdrant upsert **and** every search
-  filter — users can only retrieve vectors that belong to their own DMS user ID.
+- Every request must carry the `X-API-Key` header matching `APP_API_KEY`.
+- `owner_id` is enforced unconditionally on every Qdrant upsert and every search filter.
 - Documents without `owner_id` are skipped at sync time — no silent writes to Qdrant.
+- `user_id` from AI frontends is never passed directly to search — always resolved through
+  `UserMappingService` first.
